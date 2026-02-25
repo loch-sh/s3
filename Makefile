@@ -1,6 +1,6 @@
 NAME    = s3
 DIST    = dist
-IMAGE   = loch/$(NAME)
+IMAGE   = loch-sh/$(NAME)
 PLATFORMS = linux/amd64,linux/arm64
 
 # Rust target triples
@@ -8,9 +8,11 @@ TARGET_LINUX_AMD64   = x86_64-unknown-linux-musl
 TARGET_LINUX_ARM64   = aarch64-unknown-linux-musl
 TARGET_WINDOWS_AMD64 = x86_64-pc-windows-gnu
 TARGET_WINDOWS_ARM64 = aarch64-pc-windows-gnullvm
+TARGET_MACOS_AMD64   = x86_64-apple-darwin
+TARGET_MACOS_ARM64   = aarch64-apple-darwin
 
 .PHONY: all build release test clean docker docker-multiplatform docker-push \
-        linux-amd64 linux-arm64 windows-amd64 windows-arm64
+        linux-amd64 linux-arm64 windows-amd64 windows-arm64 macos-amd64 macos-arm64
 
 build:
 	cargo build
@@ -43,7 +45,19 @@ windows-arm64:
 	@mkdir -p $(DIST)/windows-arm64
 	cp target/$(TARGET_WINDOWS_ARM64)/release/$(NAME).exe $(DIST)/windows-arm64/$(NAME).exe
 
-all: linux-amd64 linux-arm64 windows-amd64 windows-arm64
+macos-amd64:
+	rustup target add $(TARGET_MACOS_AMD64)
+	cargo build --release --target $(TARGET_MACOS_AMD64)
+	@mkdir -p $(DIST)/macos-amd64
+	cp target/$(TARGET_MACOS_AMD64)/release/$(NAME) $(DIST)/macos-amd64/$(NAME)
+
+macos-arm64:
+	rustup target add $(TARGET_MACOS_ARM64)
+	cargo build --release --target $(TARGET_MACOS_ARM64)
+	@mkdir -p $(DIST)/macos-arm64
+	cp target/$(TARGET_MACOS_ARM64)/release/$(NAME) $(DIST)/macos-arm64/$(NAME)
+
+all: linux-amd64 linux-arm64 windows-amd64 windows-arm64 macos-amd64 macos-arm64
 
 docker:
 	docker build -t $(IMAGE) .

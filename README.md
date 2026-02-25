@@ -86,25 +86,27 @@ make release
 
 ```bash
 make docker
-docker run -p 9000:8080 -v s3-data:/data loch/s3
+docker run -p 9000:8080 -v s3-data:/data ghcr.io/loch-sh/s3
 
 # With authentication:
 docker run -p 9000:8080 -v s3-data:/data \
   -e S3_ACCESS_KEY_ID=myaccesskey \
   -e S3_SECRET_ACCESS_KEY=mysecretkey \
-  loch/s3
+  ghcr.io/loch-sh/s3
 
 # With authentication + SSE-S3 encryption:
 docker run -p 9000:8080 -v s3-data:/data \
   -e S3_ACCESS_KEY_ID=myaccesskey \
   -e S3_SECRET_ACCESS_KEY=mysecretkey \
   -e S3_ENCRYPTION_KEY=$(openssl rand -base64 32) \
-  loch/s3
+  ghcr.io/loch-sh/s3
 ```
 
-### Multi-platform Docker image
+Multi-platform images (`linux/amd64` + `linux/arm64`) are automatically built and pushed to [GitHub Container Registry](https://ghcr.io/loch-sh/s3) on every push to `main` and on version tags (`v*`).
 
-Build a multi-arch image (linux/amd64 + linux/arm64) using [Docker Buildx](https://docs.docker.com/build/buildx/):
+### Multi-platform Docker image (local)
+
+Build a multi-arch image locally using [Docker Buildx](https://docs.docker.com/build/buildx/):
 
 ```bash
 make docker-multiplatform    # Build only
@@ -113,15 +115,17 @@ make docker-push            # Build and push to registry
 
 ### Cross-compilation
 
-Cross-compilation requires [`cross`](https://github.com/cross-rs/cross):
+Linux and Windows cross-compilation requires [`cross`](https://github.com/cross-rs/cross). macOS targets build natively with `cargo`.
 
 ```bash
 cargo install cross
 
-make linux-amd64      # x86_64-unknown-linux-musl
-make linux-arm64      # aarch64-unknown-linux-musl
-make windows-amd64    # x86_64-pc-windows-gnu
-make windows-arm64    # aarch64-pc-windows-gnullvm
+make linux-amd64      # x86_64-unknown-linux-musl  (requires cross)
+make linux-arm64      # aarch64-unknown-linux-musl  (requires cross)
+make windows-amd64    # x86_64-pc-windows-gnu       (requires cross)
+make windows-arm64    # aarch64-pc-windows-gnullvm  (requires cross)
+make macos-amd64      # x86_64-apple-darwin         (macOS only)
+make macos-arm64      # aarch64-apple-darwin        (macOS only)
 make all              # All targets above
 ```
 

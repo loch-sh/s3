@@ -123,7 +123,6 @@ cargo install cross
 make linux-amd64      # x86_64-unknown-linux-musl  (requires cross)
 make linux-arm64      # aarch64-unknown-linux-musl  (requires cross)
 make windows-amd64    # x86_64-pc-windows-gnu       (requires cross)
-make windows-arm64    # aarch64-pc-windows-gnullvm  (requires cross)
 make macos-amd64      # x86_64-apple-darwin         (macOS only)
 make macos-arm64      # aarch64-apple-darwin        (macOS only)
 make all              # All targets above

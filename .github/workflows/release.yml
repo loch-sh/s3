@@ -21,9 +21,6 @@ jobs:
           - target: x86_64-pc-windows-gnu
             runner: ubuntu-latest
             archive: s3-windows-amd64.zip
-          - target: aarch64-pc-windows-gnullvm
-            runner: ubuntu-latest
-            archive: s3-windows-arm64.zip
           - target: x86_64-apple-darwin
             runner: macos-latest
             archive: s3-macos-amd64.tar.gz

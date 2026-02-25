@@ -7,12 +7,11 @@ PLATFORMS = linux/amd64,linux/arm64
 TARGET_LINUX_AMD64   = x86_64-unknown-linux-musl
 TARGET_LINUX_ARM64   = aarch64-unknown-linux-musl
 TARGET_WINDOWS_AMD64 = x86_64-pc-windows-gnu
-TARGET_WINDOWS_ARM64 = aarch64-pc-windows-gnullvm
 TARGET_MACOS_AMD64   = x86_64-apple-darwin
 TARGET_MACOS_ARM64   = aarch64-apple-darwin
 
 .PHONY: all build release test clean docker docker-multiplatform docker-push \
-        linux-amd64 linux-arm64 windows-amd64 windows-arm64 macos-amd64 macos-arm64
+        linux-amd64 linux-arm64 windows-amd64 macos-amd64 macos-arm64
 
 build:
 	cargo build
@@ -40,11 +39,6 @@ windows-amd64:
 	@mkdir -p $(DIST)/windows-amd64
 	cp target/$(TARGET_WINDOWS_AMD64)/release/$(NAME).exe $(DIST)/windows-amd64/$(NAME).exe
 
-windows-arm64:
-	cross build --release --target $(TARGET_WINDOWS_ARM64)
-	@mkdir -p $(DIST)/windows-arm64
-	cp target/$(TARGET_WINDOWS_ARM64)/release/$(NAME).exe $(DIST)/windows-arm64/$(NAME).exe
-
 macos-amd64:
 	rustup target add $(TARGET_MACOS_AMD64)
 	cargo build --release --target $(TARGET_MACOS_AMD64)
@@ -57,7 +51,7 @@ macos-arm64:
 	@mkdir -p $(DIST)/macos-arm64
 	cp target/$(TARGET_MACOS_ARM64)/release/$(NAME) $(DIST)/macos-arm64/$(NAME)
 
-all: linux-amd64 linux-arm64 windows-amd64 windows-arm64 macos-amd64 macos-arm64
+all: linux-amd64 linux-arm64 windows-amd64 macos-amd64 macos-arm64
 
 docker:
 	docker build -t $(IMAGE) .

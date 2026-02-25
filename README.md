@@ -102,7 +102,7 @@ docker run -p 9000:8080 -v s3-data:/data \
   ghcr.io/loch-sh/s3
 ```
 
-Multi-platform images (`linux/amd64` + `linux/arm64`) are automatically built and pushed to [GitHub Container Registry](https://ghcr.io/loch-sh/s3) on every push to `main` and on version tags (`v*`).
+Multi-platform images (`linux/amd64` + `linux/arm64`) are automatically built and pushed to [GitHub Container Registry](https://ghcr.io/loch-sh/s3) on version tags.
 
 ### Multi-platform Docker image (local)
 

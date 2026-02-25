@@ -1,0 +1,29 @@
+services:
+  caddy:
+    image: caddy:2.11-alpine
+    ports:
+      - "80:80"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+
+  s3:
+    build: .
+    image: loch/s3
+    ports:
+      - "8080:8080"
+    environment:
+      - S3_PORT=8080
+      - S3_DATA_DIR=/data
+      - S3_ACCESS_KEY_ID=myaccesskey
+      - S3_SECRET_ACCESS_KEY=mysecretkey
+      # Example key, don't use it on production
+      - S3_ENCRYPTION_KEY=avzMRprQBF77Di5v1fGNgKOy5bF844Cg2J2ipfTIS9o=
+    volumes:
+      - s3-data:/data
+
+volumes:
+  s3-data:
+  caddy-data:

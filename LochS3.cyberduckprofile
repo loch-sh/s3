@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>Protocol</key>
+        <string>s3</string>
+        <key>Vendor</key>
+        <string>loch-s3</string>
+        <key>Description</key>
+        <string>Loch S3</string>
+        <key>Default Hostname</key>
+        <string>localhost</string>
+        <key>Default Port</key>
+        <string>8080</string>
+        <key>Scheme</key>
+        <string>http</string>
+        <key>Authorization</key>
+        <string>AWS4HMACSHA256</string>
+        <key>Region</key>
+        <string>loch-sh</string>
+        <key>Properties</key>
+        <dict>
+            <key>s3.bucket.virtualhost.disable</key>
+            <string>true</string>
+            <key>s3.hostname.default</key>
+            <string>localhost</string>
+            <key>s3.encryption.algorithm</key>
+            <string>AES256</string>
+            <key>s3.storage.class</key>
+            <string>STANDARD</string>
+            <key>s3service.default-storage-class</key>
+            <string>STANDARD</key>
+        </dict>
+    </dict>
+</plist>

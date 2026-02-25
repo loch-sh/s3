@@ -1,0 +1,29 @@
+[package]
+name = "s3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "macros", "signal"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+http-body-util = "0.1"
+md5 = "0.8"
+quick-xml = { version = "0.39", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+hmac = "0.12"
+sha2 = "0.10"
+serde_json = "1"
+chrono = "0.4"
+subtle = "2"
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+aes-gcm = "0.10"
+hkdf = "0.12"
+base64 = "0.22"
+rand = "0.8"
+
+[dev-dependencies]
+reqwest = { version = "0.13", features = ["blocking"] }

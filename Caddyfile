@@ -1,0 +1,6 @@
+localhost {
+	tls internal {
+		protocols tls1.2 tls1.3
+	}
+	reverse_proxy s3:8080
+}

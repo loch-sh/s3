@@ -79,6 +79,7 @@ pub async fn route(
     }
 
     // Check authentication
+    let is_presigned = auth::is_presigned_request(&query);
     let auth_result = auth::verify_request(&req, &config.credentials);
     if let Some(deny) = check_auth(
         &auth_result,
@@ -91,6 +92,7 @@ pub async fn route(
         has_bucket,
         has_key,
         is_management_request,
+        is_presigned,
     )
     .await
     {
@@ -287,6 +289,49 @@ pub async fn route(
         (&Method::PUT, true, true) => {
             if let Some(copy_source) = req.headers().get("x-amz-copy-source") {
                 let source = copy_source.to_str().unwrap_or("").to_string();
+
+                // If the request is anonymous (auth failed, but destination bucket policy
+                // allowed the PUT), also verify that the source bucket/key allows anonymous
+                // GET. Without this check, an anonymous user could copy private objects into
+                // a world-writable bucket.
+                if auth_result.is_err() {
+                    let src = source.trim_start_matches('/');
+                    let src_path = src.split('?').next().unwrap_or(src);
+                    if let Some(sep) = src_path.find('/') {
+                        let src_bucket = &src_path[..sep];
+                        let src_key = &src_path[sep + 1..];
+                        let policy_ok = check_anonymous_access(
+                            &storage,
+                            src_bucket,
+                            src_key,
+                            S3Action::GetObject,
+                        )
+                        .await;
+                        let acl_ok = check_acl_anonymous(
+                            &storage,
+                            src_bucket,
+                            src_key,
+                            true,
+                            &Method::GET,
+                        )
+                        .await;
+                        if !policy_ok && !acl_ok {
+                            let path = format!("/{}/{}", bucket, key);
+                            let deny = handlers::error_response(S3Error::AccessDenied, &path);
+                            let response = maybe_add_cors_headers(
+                                deny,
+                                &storage,
+                                &bucket,
+                                &method,
+                                origin.as_deref(),
+                            )
+                            .await;
+                            eprintln!("<-- 403 {}", uri);
+                            return Ok(response);
+                        }
+                    }
+                }
+
                 handlers::object::copy_object(config.clone(), &bucket, &key, &source, req).await
             } else {
                 handlers::object::put_object(config.clone(), &bucket, &key, req).await
@@ -340,6 +385,7 @@ async fn check_auth(
     has_bucket: bool,
     has_key: bool,
     is_management_request: bool,
+    is_presigned: bool,
 ) -> Option<Response<BoxBody>> {
     let auth_err = match auth_result {
         Err(e) => e,
@@ -348,6 +394,11 @@ async fn check_auth(
 
     if config.credentials.is_none() {
         return None;
+    }
+
+    // Presigned URL auth failure: deny immediately, no anonymous fallback
+    if is_presigned {
+        return Some(handlers::error_response(auth_err.clone(), path));
     }
 
     // Management endpoints always require auth

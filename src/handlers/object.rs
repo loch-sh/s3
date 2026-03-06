@@ -16,15 +16,26 @@ use crate::storage::versioning::{VersionMeta, VersioningStatus};
 use crate::storage::{Storage, guess_content_type};
 use crate::xml;
 
+/// AWS S3 limit for user-defined metadata (sum of all key + value lengths).
+const MAX_USER_METADATA_BYTES: usize = 2048;
+
 /// Extract S3 metadata headers from the request.
-fn extract_metadata(req: &Request<Incoming>) -> StoredMetadata {
+/// Returns `EntityTooLarge` if `x-amz-meta-*` headers exceed 2 KB in total.
+fn extract_metadata(req: &Request<Incoming>) -> Result<StoredMetadata, S3Error> {
     let headers = req.headers();
     let mut user_metadata = std::collections::HashMap::new();
+    let mut meta_total: usize = 0;
 
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
         if let Some(meta_key) = name_str.strip_prefix("x-amz-meta-") {
             if let Ok(v) = value.to_str() {
+                meta_total = meta_total
+                    .saturating_add(meta_key.len())
+                    .saturating_add(v.len());
+                if meta_total > MAX_USER_METADATA_BYTES {
+                    return Err(S3Error::EntityTooLarge);
+                }
                 user_metadata.insert(meta_key.to_string(), v.to_string());
             }
         }
@@ -48,7 +59,7 @@ fn extract_metadata(req: &Request<Incoming>) -> StoredMetadata {
         })
         .filter(|v| !v.is_empty());
 
-    StoredMetadata {
+    Ok(StoredMetadata {
         content_type: get_header("content-type"),
         cache_control: get_header("cache-control"),
         content_disposition: get_header("content-disposition"),
@@ -58,7 +69,7 @@ fn extract_metadata(req: &Request<Incoming>) -> StoredMetadata {
         user_metadata,
         encryption: None,
         etag: None,
-    }
+    })
 }
 
 /// Apply stored metadata headers to a response builder.
@@ -275,7 +286,10 @@ pub async fn put_object(
     let sse_request = apply_bucket_default_encryption(sse_request, storage, &config, bucket).await;
 
     let aws_chunked = is_aws_chunked(&req);
-    let mut metadata = extract_metadata(&req);
+    let mut metadata = match extract_metadata(&req) {
+        Ok(m) => m,
+        Err(e) => return error_response(e, &resource),
+    };
     let body = req.into_body();
 
     // Stream body to disk (plaintext) with MD5
@@ -836,7 +850,10 @@ pub async fn copy_object(
         .to_uppercase();
     let replace_metadata = metadata_directive == "REPLACE";
     let override_metadata = if replace_metadata {
-        Some(extract_metadata(&req))
+        match extract_metadata(&req) {
+            Ok(m) => Some(m),
+            Err(e) => return error_response(e, &resource),
+        }
     } else {
         None
     };

@@ -6,7 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use hkdf::Hkdf;
 use hyper::header::HeaderMap;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -248,7 +248,7 @@ pub fn derive_sse_s3_key(master_key: &[u8; 32], salt: &[u8; 32]) -> [u8; 32] {
 /// Generate random bytes of the given size.
 fn rand_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     buf
 }
 

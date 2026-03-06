@@ -65,6 +65,17 @@ This document describes the security vulnerabilities that were identified during
 
 **Files:** `src/auth.rs`, `src/error.rs`
 
+### 13. Presigned URL Invalid Auth Bypass (CWE-287) — MODERATE
+
+**Risk:** A presigned URL with an invalid or tampered signature could fall through to the anonymous-access check (bucket policies / ACLs), potentially granting access to objects in public buckets without a valid signature.
+
+**Mitigation:**
+- `is_presigned_request()` detects query-string SigV4 auth (presence of `X-Amz-Algorithm` in the query)
+- In `check_auth`, presigned requests that fail signature verification are denied immediately with no fallback to anonymous access checks — the `is_presigned` flag short-circuits before policy/ACL evaluation
+- Expired presigned URLs return `ExpiredToken` (HTTP 403) rather than `AccessDenied`, to distinguish expiry from bad credentials
+
+**Files:** `src/auth.rs`, `src/router.rs`, `src/error.rs`
+
 ### 6. Timing Attack on Signature Comparison (CWE-208) — MODERATE
 
 **Risk:** Standard `==` comparison of signatures leaks timing information, potentially allowing an attacker to discover valid signatures byte-by-byte.
@@ -117,6 +128,39 @@ This document describes the security vulnerabilities that were identified during
 
 **Files:** `src/storage/mod.rs`, `src/storage/object.rs`
 
+### 14. CopyObject Anonymous Source Authorization Bypass (CWE-862) — HIGH
+
+**Risk:** The authentication check (`check_auth`) only evaluates the destination bucket/key. For `CopyObject` (PUT with `x-amz-copy-source`), if the destination bucket allows anonymous writes via bucket policy, an unauthenticated attacker could copy any private object into the world-writable bucket using `x-amz-copy-source`, effectively reading objects they have no access to.
+
+**Mitigation:**
+- In `router.rs`, when routing a CopyObject request that was granted anonymous access (auth failed but policy allowed), the source bucket/key is parsed from `x-amz-copy-source` and verified for anonymous GET access via `check_anonymous_access` + `check_acl_anonymous`
+- If the source bucket does not allow anonymous GET, the request is denied with `403 AccessDenied` before calling the handler
+- Authenticated requests (valid credentials) are unaffected — they retain access to all buckets they are authorized for
+
+**Files:** `src/router.rs`
+
+### 15. Integer Overflow in aws-chunked Decoder (CWE-190) — MEDIUM
+
+**Risk:** The `decode_aws_chunked` function parses a hex chunk size and then computes `pos + chunk_size`. On a 64-bit target in release mode (where integer overflow wraps silently), a malicious chunk size of `usize::MAX` would cause `pos + chunk_size` to wrap to a value smaller than `pos`. The subsequent slice `data[pos..end]` with `end < pos` would then **panic**, crashing the active server task.
+
+**Mitigation:**
+- `pos.saturating_add(chunk_size)` is used instead of plain `+`, capping the result at `usize::MAX` rather than wrapping
+- The terminal `pos = end + 2` advance also uses `saturating_add` for consistency
+- Combined with the `.min(data.len())` clamp, `end >= pos` is always guaranteed
+
+**Files:** `src/storage/object.rs`
+
+### 16. Unbounded User Metadata (CWE-400) — LOW
+
+**Risk:** `x-amz-meta-*` headers were accepted without any size limit. An authenticated client could send megabytes of per-object metadata, consuming unbounded disk space and inflating every subsequent HEAD/GET response.
+
+**Mitigation:**
+- `extract_metadata()` now accumulates the total byte length of all metadata keys and values
+- If the total exceeds **2 048 bytes** (matching the AWS S3 limit), the function returns `S3Error::EntityTooLarge` (HTTP 413)
+- Both `PutObject` and `CopyObject` (with `x-amz-metadata-directive: REPLACE`) propagate this error to the client
+
+**Files:** `src/handlers/object.rs`
+
 ### 12. Sidecar File Cleanup on Object Deletion — MODERATE
 
 **Risk:** When an object was deleted, its associated sidecar files (ACL in `.acl/{key}.xml`, metadata in `.meta/{key}.json`) were not systematically cleaned up, leaving orphan files on disk. In versioned buckets, deleting all versions of an object also left sidecar files behind.
@@ -139,6 +183,54 @@ This document describes the security vulnerabilities that were identified during
 - Extracted into a reusable `add_cors_to_response()` helper to eliminate duplication
 
 **Files:** `src/router.rs`
+
+## Presigned URLs
+
+Presigned URLs embed SigV4 authentication in the query string, enabling time-limited access to specific objects without requiring the caller to have AWS credentials.
+
+### How It Works
+
+A presigned URL includes the following query parameters, all of which are covered by the signature:
+
+| Parameter | Description |
+|-----------|-------------|
+| `X-Amz-Algorithm` | Always `AWS4-HMAC-SHA256` |
+| `X-Amz-Credential` | `ACCESS_KEY/DATE/REGION/s3/aws4_request` (URL-encoded) |
+| `X-Amz-Date` | Signing timestamp (`YYYYMMDDTHHmmSSZ`) |
+| `X-Amz-Expires` | Validity duration in seconds |
+| `X-Amz-SignedHeaders` | Semicolon-separated list of signed headers (must include `host`) |
+| `X-Amz-Signature` | HMAC-SHA256 of the canonical request |
+
+The signature covers the HTTP method, URL path, all query parameters (except `X-Amz-Signature` itself), and the signed headers. Tampering with any parameter invalidates the signature.
+
+### Security Properties
+
+- **Method binding**: The HTTP method is part of the signed canonical request. A presigned `GET` cannot be reused as a `PUT` or `DELETE`.
+- **Expiry**: The server rejects URLs whose `X-Amz-Date + X-Amz-Expires` is in the past (`ExpiredToken`, HTTP 403). Expiry is enforced server-side regardless of when the URL was generated.
+- **No anonymous fallback**: A presigned URL with an invalid or expired signature is immediately rejected with no fallback to bucket policy or ACL anonymous access.
+- **Constant-time comparison**: The signature comparison uses `subtle::ConstantTimeEq` to prevent timing attacks.
+- **Path binding**: The signed path prevents a presigned URL for one object from being used to access another.
+
+### Expiry Bounds
+
+`X-Amz-Expires` is validated server-side: values of `0` or greater than `604 800` seconds (7 days) are rejected with `403 AccessDenied`, matching AWS S3 behavior.
+
+### Generate a presigned URL
+
+Presigned URLs can be generated by any AWS-compatible client. Example using the AWS CLI:
+
+```bash
+# Presigned GET valid for 1 hour
+aws --endpoint-url http://localhost:8080 s3 presign s3://my-bucket/myfile.txt --expires-in 3600
+```
+
+The generated URL can be used without any AWS credentials:
+
+```bash
+curl "http://localhost:8080/my-bucket/myfile.txt?X-Amz-Algorithm=...&X-Amz-Signature=..."
+```
+
+---
 
 ## Server-Side Encryption (SSE)
 
@@ -236,6 +328,30 @@ Each version stores its own encryption parameters. Different versions of the sam
 - **Enable authentication.** Without credentials, SSE-C keys are sent in plaintext over HTTP.
 
 **Files:** `src/encryption.rs`, `src/handlers/object.rs`, `src/handlers/multipart.rs`, `src/storage/object.rs`, `src/storage/multipart.rs`, `src/storage/versioning.rs`
+
+## Security Audit Log
+
+### 2026-03-06 — Dependency CVE Scan
+
+Tool: `cargo-audit v0.22.1` against RustSec advisory database (946 advisories).
+
+**Result: 0 vulnerabilities in 251 crate dependencies.**
+
+All direct and transitive dependencies are free of known CVEs as of this date.
+
+### 2026-03-06 — Code Audit Findings
+
+| Finding | Severity | Status |
+|---------|----------|--------|
+| Presigned URL invalid-auth bypass (CWE-287) | Moderate | Fixed — §13 above |
+| `aws_chunked` upload buffered in memory | Low | Known — chunked-encoded bodies are buffered in full before streaming to disk; only affects AWS SDK streaming uploads. Mitigated by OS-level connection limits. |
+| `aws_chunked` chunk-size integer overflow → panic (CWE-190) | Medium | Fixed — §15 above (`saturating_add`) |
+| CopyObject anonymous source authorization bypass (CWE-862) | High | Fixed — §14 above (source bucket policy/ACL check for anonymous requests) |
+| Unbounded user metadata (CWE-400) | Low | Fixed — §16 above (2 048-byte limit, returns 413) |
+| `ListObjects` ETag/size discrepancy for encrypted objects | Informational | Known — `ListObjects` reports ciphertext size and MD5; `HeadObject` / `GetObject` report plaintext size and plaintext MD5. Correctness gap, not a security issue. |
+| `X-Amz-Expires` has no server-side upper bound | Low | Fixed — values `0` or `> 604 800 s` are rejected with 403 (`MAX_PRESIGNED_EXPIRES_SECS` in `src/auth.rs`). |
+
+---
 
 ## Dependencies Added
 

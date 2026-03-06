@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use hyper::Request;
 use hyper::body::Incoming;
@@ -14,7 +14,13 @@ pub struct Credentials {
     pub secret_access_key: String,
 }
 
+/// Returns true if the request uses presigned URL (query-string) authentication.
+pub fn is_presigned_request(query: &str) -> bool {
+    query.split('&').any(|p| p.starts_with("X-Amz-Algorithm="))
+}
+
 /// Verify the AWS Signature Version 4 on an incoming request.
+/// Handles both Authorization-header auth and presigned URL (query-string) auth.
 /// Returns Ok(()) if the signature is valid, or an S3Error otherwise.
 /// If no credentials are configured, all requests are allowed.
 pub fn verify_request(
@@ -23,10 +29,20 @@ pub fn verify_request(
 ) -> Result<(), S3Error> {
     let creds = match credentials {
         Some(c) => c,
-        None => return Ok(()), // No auth configured, allow all
+        None => return Ok(()),
     };
 
-    // Parse the Authorization header
+    let query = req.uri().query().unwrap_or("");
+    if is_presigned_request(query) {
+        verify_presigned(req, creds, query)
+    } else {
+        verify_header_auth(req, creds)
+    }
+}
+
+// ---- Header-based auth ----
+
+fn verify_header_auth(req: &Request<Incoming>, creds: &Credentials) -> Result<(), S3Error> {
     let auth_header = req
         .headers()
         .get("authorization")
@@ -35,64 +51,146 @@ pub fn verify_request(
 
     let parsed = parse_auth_header(auth_header).ok_or(S3Error::AccessDenied)?;
 
-    // Verify the access key ID matches
     if parsed.access_key_id != creds.access_key_id {
         return Err(S3Error::AccessDenied);
     }
 
-    // Get canonical SigV4 timestamp from x-amz-date or HTTP Date header.
     let amz_date = resolve_amz_date(req)?;
-
-    // Validate timestamp is within 15 minutes of server time.
     validate_request_time(&amz_date)?;
 
-    // Get the payload hash (x-amz-content-sha256)
     let payload_hash = req
         .headers()
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("UNSIGNED-PAYLOAD");
 
-    // Build canonical request
-    let canonical_request = build_canonical_request(req, &parsed.signed_headers, payload_hash);
-    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
-
-    // Build string to sign
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date, parsed.scope, canonical_request_hash
-    );
-
-    // Derive the signing key
+    let scope_parts: Vec<&str> = parsed.scope.split('/').collect();
+    if scope_parts.len() != 4 || scope_parts[2] != "s3" || scope_parts[3] != "aws4_request" {
+        return Err(S3Error::AccessDenied);
+    }
     if amz_date.len() < 8 {
         return Err(S3Error::AccessDenied);
     }
-    let date_stamp = &amz_date[..8]; // YYYYMMDD
-    let scope_parts: Vec<&str> = parsed.scope.split('/').collect();
-    if scope_parts.len() != 4 {
-        return Err(S3Error::AccessDenied);
-    }
-    if scope_parts[2] != "s3" || scope_parts[3] != "aws4_request" {
-        return Err(S3Error::AccessDenied);
-    }
+    let date_stamp = &amz_date[..8];
     let region = scope_parts[1];
     let service = scope_parts[2];
 
+    let canonical_query = canonical_query_string(req.uri().query().unwrap_or(""), None);
+    let canonical_req =
+        build_canonical_request(req, &parsed.signed_headers, &canonical_query, payload_hash);
+    let canonical_req_hash = sha256_hex(canonical_req.as_bytes());
+
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        amz_date, parsed.scope, canonical_req_hash
+    );
+
     let signing_key = derive_signing_key(&creds.secret_access_key, date_stamp, region, service);
+    let expected = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
 
-    // Calculate expected signature
-    let expected_signature = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
+    verify_signature(&expected, parsed.signature)
+}
 
-    // Constant-time comparison to prevent timing attacks
-    let expected_bytes = expected_signature.as_bytes();
-    let actual_bytes = parsed.signature.as_bytes();
-    if expected_bytes.len() == actual_bytes.len() && bool::from(expected_bytes.ct_eq(actual_bytes))
+// ---- Presigned URL auth ----
+
+fn verify_presigned(req: &Request<Incoming>, creds: &Credentials, query: &str) -> Result<(), S3Error> {
+    let mut algorithm = None::<String>;
+    let mut credential = None::<String>;
+    let mut amz_date = None::<String>;
+    let mut expires_str = None::<String>;
+    let mut signed_headers_param = None::<String>;
+    let mut signature = None::<String>;
+
+    for part in query.split('&').filter(|p| !p.is_empty()) {
+        if let Some((k, v)) = part.split_once('=') {
+            let v = uri_decode(v);
+            match k {
+                "X-Amz-Algorithm" => algorithm = Some(v),
+                "X-Amz-Credential" => credential = Some(v),
+                "X-Amz-Date" => amz_date = Some(v),
+                "X-Amz-Expires" => expires_str = Some(v),
+                "X-Amz-SignedHeaders" => signed_headers_param = Some(v),
+                "X-Amz-Signature" => signature = Some(v),
+                _ => {}
+            }
+        }
+    }
+
+    let algorithm = algorithm.ok_or(S3Error::AccessDenied)?;
+    if algorithm != "AWS4-HMAC-SHA256" {
+        return Err(S3Error::AccessDenied);
+    }
+
+    let credential = credential.ok_or(S3Error::AccessDenied)?;
+    let amz_date = amz_date.ok_or(S3Error::AccessDenied)?;
+    let expires_secs: u64 = expires_str
+        .ok_or(S3Error::AccessDenied)?
+        .parse()
+        .map_err(|_| S3Error::AccessDenied)?;
+    let signed_headers_param = signed_headers_param.ok_or(S3Error::AccessDenied)?;
+    let signature = signature.ok_or(S3Error::AccessDenied)?;
+
+    // credential = AKID/DATE/REGION/SERVICE/aws4_request
+    let (access_key_id, scope) = credential.split_once('/').ok_or(S3Error::AccessDenied)?;
+    if access_key_id != creds.access_key_id {
+        return Err(S3Error::AccessDenied);
+    }
+
+    let scope_parts: Vec<&str> = scope.split('/').collect();
+    if scope_parts.len() != 4 || scope_parts[2] != "s3" || scope_parts[3] != "aws4_request" {
+        return Err(S3Error::AccessDenied);
+    }
+    let date_stamp = scope_parts[0];
+    let region = scope_parts[1];
+    let service = scope_parts[2];
+
+    validate_presigned_expiry(&amz_date, expires_secs)?;
+
+    // Canonical query: all params sorted, excluding X-Amz-Signature
+    let canonical_query = canonical_query_string(query, Some("X-Amz-Signature"));
+    let signed_headers: Vec<&str> = signed_headers_param.split(';').collect();
+    let canonical_req =
+        build_canonical_request(req, &signed_headers, &canonical_query, "UNSIGNED-PAYLOAD");
+    let canonical_req_hash = sha256_hex(canonical_req.as_bytes());
+
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        amz_date, scope, canonical_req_hash
+    );
+
+    let signing_key = derive_signing_key(&creds.secret_access_key, date_stamp, region, service);
+    let expected = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
+
+    verify_signature(&expected, &signature)
+}
+
+/// Maximum allowed presigned URL validity (7 days), matching AWS S3.
+const MAX_PRESIGNED_EXPIRES_SECS: u64 = 604_800;
+
+fn validate_presigned_expiry(amz_date: &str, expires_secs: u64) -> Result<(), S3Error> {
+    if expires_secs == 0 || expires_secs > MAX_PRESIGNED_EXPIRES_SECS {
+        return Err(S3Error::AccessDenied);
+    }
+    let request_time = NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+        .map_err(|_| S3Error::AccessDenied)?;
+    let expiry = request_time + Duration::seconds(expires_secs as i64);
+    if Utc::now().naive_utc() > expiry {
+        return Err(S3Error::ExpiredToken);
+    }
+    Ok(())
+}
+
+fn verify_signature(expected: &str, actual: &str) -> Result<(), S3Error> {
+    if expected.as_bytes().len() == actual.as_bytes().len()
+        && bool::from(expected.as_bytes().ct_eq(actual.as_bytes()))
     {
         Ok(())
     } else {
         Err(S3Error::SignatureDoesNotMatch)
     }
 }
+
+// ---- Shared helpers ----
 
 fn resolve_amz_date(req: &Request<Incoming>) -> Result<String, S3Error> {
     if let Some(amz_date) = req
@@ -166,21 +264,16 @@ fn parse_auth_header(header: &str) -> Option<AuthHeader<'_>> {
 }
 
 /// Build the canonical request string for SigV4.
+/// `canonical_query` is pre-computed (differs between header auth and presigned auth).
 fn build_canonical_request(
     req: &Request<Incoming>,
     signed_headers: &[&str],
+    canonical_query: &str,
     payload_hash: &str,
 ) -> String {
     let method = req.method().as_str();
-    let path = req.uri().path();
+    let canonical_uri = canonical_uri_encode(req.uri().path());
 
-    // Canonical URI: URL-encode the path but keep /
-    let canonical_uri = canonical_uri_encode(path);
-
-    // Canonical query string: sorted by parameter name
-    let canonical_query = canonical_query_string(req.uri().query().unwrap_or(""));
-
-    // Canonical headers: lowercase header names, trimmed values, sorted
     let mut canonical_headers = String::new();
     for header_name in signed_headers {
         let value = req
@@ -238,21 +331,27 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
     result
 }
 
-/// Build the canonical query string (sorted by parameter name).
+/// Build the canonical query string (sorted by key then value).
 /// Query parameters from the HTTP request may already be percent-encoded,
 /// so we decode first to avoid double-encoding before re-encoding per SigV4 rules.
-fn canonical_query_string(query: &str) -> String {
+/// If `exclude` is Some(key), that key is omitted (used for presigned URL verification).
+fn canonical_query_string(query: &str, exclude: Option<&str>) -> String {
     if query.is_empty() {
         return String::new();
     }
     let mut pairs: Vec<(String, String)> = query
         .split('&')
         .filter(|p| !p.is_empty())
-        .map(|p| {
-            if let Some((k, v)) = p.split_once('=') {
+        .filter_map(|p| {
+            let (k, v) = if let Some((k, v)) = p.split_once('=') {
                 (uri_decode(k), uri_decode(v))
             } else {
                 (uri_decode(p), String::new())
+            };
+            if exclude.is_some_and(|ex| ex == k) {
+                None
+            } else {
+                Some((k, v))
             }
         })
         .collect();
@@ -265,7 +364,6 @@ fn canonical_query_string(query: &str) -> String {
 }
 
 /// Percent-decode a URI component (RFC 3986).
-/// Decodes %XX sequences back to raw bytes.
 fn uri_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut result = Vec::with_capacity(bytes.len());
@@ -368,17 +466,38 @@ mod tests {
 
     #[test]
     fn test_canonical_query_string() {
-        assert_eq!(canonical_query_string(""), "");
-        assert_eq!(canonical_query_string("b=2&a=1"), "a=1&b=2");
+        assert_eq!(canonical_query_string("", None), "");
+        assert_eq!(canonical_query_string("b=2&a=1", None), "a=1&b=2");
         assert_eq!(
-            canonical_query_string("list-type=2&prefix=test"),
+            canonical_query_string("list-type=2&prefix=test", None),
             "list-type=2&prefix=test"
         );
         // Pre-encoded values must not be double-encoded
         assert_eq!(
-            canonical_query_string("delimiter=%2F&list-type=2"),
+            canonical_query_string("delimiter=%2F&list-type=2", None),
             "delimiter=%2F&list-type=2"
         );
+    }
+
+    #[test]
+    fn test_canonical_query_string_exclude() {
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc123&b=2&a=1";
+        let result = canonical_query_string(query, Some("X-Amz-Signature"));
+        assert!(!result.contains("X-Amz-Signature"));
+        assert!(result.contains("X-Amz-Algorithm"));
+        assert_eq!(
+            result,
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&a=1&b=2"
+        );
+    }
+
+    #[test]
+    fn test_is_presigned_request() {
+        assert!(is_presigned_request(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc"
+        ));
+        assert!(!is_presigned_request("list-type=2&prefix=test"));
+        assert!(!is_presigned_request(""));
     }
 
     #[test]

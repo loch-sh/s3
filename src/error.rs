@@ -20,6 +20,7 @@ pub enum S3Error {
     InvalidObjectKey,
     EntityTooLarge,
     RequestTimeTooSkewed,
+    ExpiredToken,
     NoSuchVersion,
     MethodNotAllowed,
     InvalidEncryptionAlgorithmError,
@@ -113,6 +114,11 @@ impl S3Error {
                 "RequestTimeTooSkewed",
                 StatusCode::FORBIDDEN,
                 "The difference between the request time and the server\u{2019}s time is too large.",
+            ),
+            S3Error::ExpiredToken => (
+                "ExpiredToken",
+                StatusCode::FORBIDDEN,
+                "The provided token has expired.",
             ),
             S3Error::NoSuchVersion => (
                 "NoSuchVersion",

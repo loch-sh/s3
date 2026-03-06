@@ -894,6 +894,377 @@ async fn test_no_auth_configured_allows_all() {
     cleanup(&tmp_dir);
 }
 
+// ======== Presigned URL tests ========
+
+/// Generate a presigned GET URL for a given path.
+fn sign_presigned_url(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    host: &str,
+    expires_secs: u64,
+    access_key: &str,
+    secret_key: &str,
+) -> String {
+    sign_presigned_url_at(
+        base_url,
+        method,
+        path,
+        host,
+        expires_secs,
+        access_key,
+        secret_key,
+        chrono::Utc::now(),
+    )
+}
+
+fn sign_presigned_url_at(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    host: &str,
+    expires_secs: u64,
+    access_key: &str,
+    secret_key: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date_stamp = now.format("%Y%m%d").to_string();
+    let region = "loch-sh";
+    let service = "s3";
+    let scope = format!("{}/{}/{}/aws4_request", date_stamp, region, service);
+
+    // X-Amz-Credential value: slashes URL-encoded
+    let credential_raw = format!("{}/{}", access_key, scope);
+    let credential_encoded = credential_raw.replace('/', "%2F");
+
+    let signed_headers = "host";
+
+    // Build sorted query params (without X-Amz-Signature)
+    let mut params: Vec<(&str, String)> = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential", credential_encoded),
+        ("X-Amz-Date", amz_date.clone()),
+        ("X-Amz-Expires", expires_secs.to_string()),
+        ("X-Amz-SignedHeaders", signed_headers.to_string()),
+    ];
+    params.sort_by(|a, b| a.0.cmp(b.0));
+
+    let query_without_sig = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    // Canonical query: decode %2F back to /, then re-encode with uri_encode
+    // For our params, X-Amz-Credential slashes become %2F in both raw and canonical form
+    // because uri_encode(encode_slash=true) encodes / as %2F
+    // Other params have no special chars, so canonical == raw.
+    // We sort alphabetically (already done above).
+    let canonical_query = query_without_sig.clone();
+
+    // Canonical headers
+    let canonical_headers = format!("host:{}\n", host);
+
+    // Canonical request
+    let canonical_req = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, path, canonical_query, canonical_headers, signed_headers, "UNSIGNED-PAYLOAD"
+    );
+    let canonical_req_hash = sha256_hex(canonical_req.as_bytes());
+
+    // String to sign
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        amz_date, scope, canonical_req_hash
+    );
+
+    // Sign
+    let signing_key = derive_signing_key(secret_key, &date_stamp, region, service);
+    let signature = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
+
+    format!(
+        "{}{}?{}&X-Amz-Signature={}",
+        base_url, path, query_without_sig, signature
+    )
+}
+
+#[tokio::test]
+async fn test_presigned_url_get() {
+    let (base_url, tmp_dir) = start_server_with_auth(Some(Credentials {
+        access_key_id: TEST_ACCESS_KEY.to_string(),
+        secret_access_key: TEST_SECRET_KEY.to_string(),
+    }))
+    .await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Create bucket and upload object (signed)
+    let req = sign_request(
+        client.put(format!("{}/presigned-bucket", base_url)),
+        "PUT",
+        "/presigned-bucket",
+        "",
+        host,
+        b"",
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    assert_eq!(req.send().await.unwrap().status(), 200);
+
+    let content = b"hello presigned world";
+    let req = sign_request(
+        client
+            .put(format!("{}/presigned-bucket/file.txt", base_url))
+            .body(&content[..]),
+        "PUT",
+        "/presigned-bucket/file.txt",
+        "",
+        host,
+        content,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    assert_eq!(req.send().await.unwrap().status(), 200);
+
+    // GET via presigned URL (no Authorization header)
+    let url = sign_presigned_url(
+        &base_url,
+        "GET",
+        "/presigned-bucket/file.txt",
+        host,
+        3600,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "Presigned GET should return 200");
+    assert_eq!(&resp.bytes().await.unwrap()[..], content);
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_presigned_url_expired() {
+    let (base_url, tmp_dir) = start_server_with_auth(Some(Credentials {
+        access_key_id: TEST_ACCESS_KEY.to_string(),
+        secret_access_key: TEST_SECRET_KEY.to_string(),
+    }))
+    .await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Create bucket and object
+    let req = sign_request(
+        client.put(format!("{}/exp-bucket", base_url)),
+        "PUT",
+        "/exp-bucket",
+        "",
+        host,
+        b"",
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    req.send().await.unwrap();
+
+    let req = sign_request(
+        client
+            .put(format!("{}/exp-bucket/file.txt", base_url))
+            .body("data"),
+        "PUT",
+        "/exp-bucket/file.txt",
+        "",
+        host,
+        b"data",
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    req.send().await.unwrap();
+
+    // Sign URL with timestamp 2 hours in the past, 1-second expiry
+    let past = chrono::Utc::now() - chrono::Duration::hours(2);
+    let url = sign_presigned_url_at(
+        &base_url,
+        "GET",
+        "/exp-bucket/file.txt",
+        host,
+        1,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        past,
+    );
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "Expired presigned URL should return 403"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<Code>ExpiredToken</Code>"));
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_presigned_url_wrong_secret() {
+    let (base_url, tmp_dir) = start_server_with_auth(Some(Credentials {
+        access_key_id: TEST_ACCESS_KEY.to_string(),
+        secret_access_key: TEST_SECRET_KEY.to_string(),
+    }))
+    .await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Sign with wrong secret key
+    let url = sign_presigned_url(
+        &base_url,
+        "GET",
+        "/some-bucket/file.txt",
+        host,
+        3600,
+        TEST_ACCESS_KEY,
+        "WRONGSECRETKEY00000000000000000000000000",
+    );
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 403, "Wrong secret should return 403");
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_presigned_url_expires_too_large() {
+    let (base_url, tmp_dir) = start_server_with_auth(Some(Credentials {
+        access_key_id: TEST_ACCESS_KEY.to_string(),
+        secret_access_key: TEST_SECRET_KEY.to_string(),
+    }))
+    .await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // 604801 seconds > 7 days — must be rejected
+    let url = sign_presigned_url(
+        &base_url,
+        "GET",
+        "/any-bucket/any-key",
+        host,
+        604_801,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 403, "Expires > 7 days should return 403");
+
+    // 0 seconds (unlimited) — must be rejected
+    let url = sign_presigned_url(
+        &base_url,
+        "GET",
+        "/any-bucket/any-key",
+        host,
+        0,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 403, "Unlimited expires should return 403");
+
+    // Exactly 604800 seconds is allowed (not expired yet, just created)
+    let url = sign_presigned_url(
+        &base_url,
+        "GET",
+        "/any-bucket/any-key",
+        host,
+        604_800,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    let resp = client.get(&url).send().await.unwrap();
+    // Returns 404 (bucket not found), not 403 — the expiry value was accepted
+    assert_ne!(
+        resp.status(),
+        403,
+        "Expires = 7 days should not be rejected for expiry"
+    );
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_presigned_url_no_anonymous_fallback() {
+    // A presigned URL with invalid signature must NOT fall back to anonymous access,
+    // even if a public bucket policy is set.
+    let (base_url, tmp_dir) = start_server_with_auth(Some(Credentials {
+        access_key_id: TEST_ACCESS_KEY.to_string(),
+        secret_access_key: TEST_SECRET_KEY.to_string(),
+    }))
+    .await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Create bucket and set public-read policy
+    let req = sign_request(
+        client.put(format!("{}/pub-presigned", base_url)),
+        "PUT",
+        "/pub-presigned",
+        "",
+        host,
+        b"",
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    req.send().await.unwrap();
+
+    let req = sign_request(
+        client
+            .put(format!("{}/pub-presigned/file.txt", base_url))
+            .body("public"),
+        "PUT",
+        "/pub-presigned/file.txt",
+        "",
+        host,
+        b"public",
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    req.send().await.unwrap();
+
+    let policy_json = r#"{
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pub-presigned/*"}]
+    }"#;
+    let req = sign_request(
+        client
+            .put(format!("{}/pub-presigned?policy", base_url))
+            .body(policy_json),
+        "PUT",
+        "/pub-presigned",
+        "policy",
+        host,
+        policy_json.as_bytes(),
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+    );
+    req.send().await.unwrap();
+
+    // Sign with wrong secret
+    let url = sign_presigned_url(
+        &base_url,
+        "GET",
+        "/pub-presigned/file.txt",
+        host,
+        3600,
+        TEST_ACCESS_KEY,
+        "WRONGSECRETKEY00000000000000000000000000",
+    );
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "Invalid presigned URL must not fall back to public policy"
+    );
+
+    cleanup(&tmp_dir);
+}
+
 // ======== Bucket Policy tests ========
 
 #[tokio::test]

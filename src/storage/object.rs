@@ -578,10 +578,11 @@ fn decode_aws_chunked(data: &[u8]) -> Vec<u8> {
             break; // final chunk, ignore trailers
         }
 
-        // Read chunk data
-        let end = (pos + chunk_size).min(data.len());
+        // Read chunk data — use saturating_add to prevent wrapping overflow on
+        // maliciously large chunk-size values (which would make end < pos and panic).
+        let end = pos.saturating_add(chunk_size).min(data.len());
         result.extend_from_slice(&data[pos..end]);
-        pos = end + 2; // skip data + \r\n
+        pos = end.saturating_add(2); // skip data + \r\n
     }
 
     result

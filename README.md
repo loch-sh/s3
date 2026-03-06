@@ -17,6 +17,7 @@ It is designed primarily for server-to-server use, as it is better in our opinio
 - **Multipart upload**: Create, upload parts, complete, abort, list parts and uploads
 - **AWS CLI compatible**: Works with `aws s3`, `aws s3api`, and S3 SDKs via `--endpoint-url`
 - **Server-side encryption**: SSE-S3 (server-managed key) and SSE-C (customer-provided key) with AES-256-GCM
+- **Presigned URLs**: Time-limited signed URLs for temporary object access without credentials
 - **Authentication**: Optional AWS Signature V4 authentication
 - **Bucket policies**: Per-bucket public access control (anonymous read, etc.)
 - **Access control lists (ACLs)**: Bucket and object ACLs with canned ACL support (`private`, `public-read`, `public-read-write`)
@@ -66,6 +67,8 @@ It is designed primarily for server-to-server use, as it is better in our opinio
 | PutBucketEncryption      | `PUT`     | `/{bucket}?encryption`                         |
 | GetBucketEncryption      | `GET`     | `/{bucket}?encryption`                         |
 | DeleteBucketEncryption   | `DELETE`  | `/{bucket}?encryption`                         |
+| GetObject (presigned)    | `GET`     | `/{bucket}/{key}?X-Amz-Algorithm=...`          |
+| PutObject (presigned)    | `PUT`     | `/{bucket}/{key}?X-Amz-Algorithm=...`          |
 
 ## Prerequisites
 
@@ -416,6 +419,34 @@ aws --endpoint-url http://localhost:8080 s3api copy-object \
   --server-side-encryption AES256
 ```
 
+### Presigned URLs
+
+Presigned URLs embed SigV4 authentication directly in the query string, granting time-limited access to a specific object without requiring the requester to have AWS credentials.
+
+```bash
+# Generate a presigned GET URL valid for 1 hour
+aws --endpoint-url http://localhost:8080 s3 presign s3://my-bucket/file.txt --expires-in 3600
+# Outputs: http://localhost:8080/my-bucket/file.txt?X-Amz-Algorithm=...&X-Amz-Signature=...
+
+# Anyone can download the object using the URL
+curl "http://localhost:8080/my-bucket/file.txt?X-Amz-Algorithm=...&X-Amz-Signature=..."
+```
+
+The signature covers the HTTP method, path, all query parameters, and the `host` header — tampering with any part of the URL invalidates it. After expiry, the server returns `403 ExpiredToken`.
+
+Presigned PUT enables direct upload without exposing credentials:
+
+```bash
+# Generate a presigned PUT URL
+PRESIGNED=$(aws --endpoint-url http://localhost:8080 s3 presign \
+  --expires-in 300 s3://my-bucket/upload.bin)
+
+# Upload directly
+curl -X PUT --data-binary @localfile.bin "$PRESIGNED"
+```
+
+See [SECURITY.md](SECURITY.md#presigned-urls) for the security model and known limitations.
+
 ### CORS configuration
 
 ```bash
@@ -509,6 +540,7 @@ The integration test suite covers:
 - Object versioning: enable/get status, multiple versions, version-specific get/head, delete markers, delete marker removal, permanent version deletion, list object versions, copy with source versionId, pre-existing object migration, versioning does not affect ListObjectsV2
 - Object metadata: roundtrip persistence (PUT/GET/HEAD), Content-Type override, backward compatibility, copy with COPY/REPLACE directive, metadata cleanup on delete
 - Server-side encryption: SSE-S3 PUT/GET/HEAD, SSE-C PUT/GET/HEAD, SSE-S3/SSE-C multipart upload, copy between encryption modes, error cases (missing key, wrong key, invalid algorithm, no master key configured), ETag integrity, large object multi-chunk encryption
+- Presigned URLs: valid presigned GET, expired URL rejection (`ExpiredToken`), wrong secret rejection, no fallback to anonymous access on invalid signature
 
 ## Known Limitations
 

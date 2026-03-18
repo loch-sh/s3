@@ -28,7 +28,7 @@ It is designed primarily for server-to-server use, as it is better in our opinio
 - **Concurrent**: Handles multiple requests in parallel with atomic writes
 - **Docker ready**: Multi-stage Alpine-based image (~15 MB)
 
-## Supported Endpoints
+## S3 Endpoints
 
 | Operation                | Method    | Path                                           |
 | ------------------------ | --------- | ---------------------------------------------- |
@@ -70,10 +70,19 @@ It is designed primarily for server-to-server use, as it is better in our opinio
 | DeleteBucketEncryption   | `DELETE`  | `/{bucket}?encryption`                         |
 | GetObject (presigned)    | `GET`     | `/{bucket}/{key}?X-Amz-Algorithm=...`          |
 | PutObject (presigned)    | `PUT`     | `/{bucket}/{key}?X-Amz-Algorithm=...`          |
-| ListUsers               | `GET`     | `/_loch/users`                                 |
-| GetUser                 | `GET`     | `/_loch/users/{user_id}`                       |
-| CreateOrUpdateUser      | `PUT`     | `/_loch/users/{user_id}`                       |
-| DeleteUser              | `DELETE`  | `/_loch/users/{user_id}`                       |
+
+These endpoints use AWS Signature V4 authentication (when configured). They are compatible with the AWS CLI and S3 SDKs.
+
+## Admin Endpoints
+
+User management API, protected by `S3_ADMIN_API_KEY` (Bearer token). Only available in multi-user mode (`S3_USERS_FILE`).
+
+| Operation          | Method   | Path                     | Description                                          |
+| ------------------ | -------- | ------------------------ | ---------------------------------------------------- |
+| ListUsers          | `GET`    | `/_loch/users`           | List all users (secret keys are never returned)      |
+| GetUser            | `GET`    | `/_loch/users/{user_id}` | Get a specific user                                  |
+| CreateOrUpdateUser | `PUT`    | `/_loch/users/{user_id}` | Create or update a user (root cannot be modified)    |
+| DeleteUser         | `DELETE` | `/_loch/users/{user_id}` | Delete a user (root cannot be deleted)               |
 
 ## Prerequisites
 
@@ -643,4 +652,4 @@ The integration test suite covers:
 
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](LICENSE).

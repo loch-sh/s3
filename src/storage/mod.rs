@@ -214,6 +214,7 @@ pub(crate) const INTERNAL_NAMES: &[&str] = &[
     ".uploads",
     ".versions",
     ".versioning.json",
+    ".users.json",
 ];
 
 #[cfg(test)]

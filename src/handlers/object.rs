@@ -69,6 +69,7 @@ fn extract_metadata(req: &Request<Incoming>) -> Result<StoredMetadata, S3Error> 
         user_metadata,
         encryption: None,
         etag: None,
+        owner: None,
     })
 }
 
@@ -272,6 +273,7 @@ pub async fn put_object(
     bucket: &str,
     key: &str,
     req: Request<Incoming>,
+    owner: Option<&str>,
 ) -> Response<BoxBody> {
     let resource = format!("/{}/{}", bucket, key);
     let storage = &config.storage;
@@ -290,6 +292,7 @@ pub async fn put_object(
         Ok(m) => m,
         Err(e) => return error_response(e, &resource),
     };
+    metadata.owner = owner.map(|s| s.to_string());
     let body = req.into_body();
 
     // Stream body to disk (plaintext) with MD5
@@ -836,6 +839,7 @@ pub async fn copy_object(
     key: &str,
     copy_source: &str,
     req: Request<Incoming>,
+    owner: Option<&str>,
 ) -> Response<BoxBody> {
     let storage = &config.storage;
     let resource = format!("/{}/{}", bucket, key);
@@ -1050,6 +1054,7 @@ pub async fn copy_object(
     if dst_metadata.encryption.is_some() {
         dst_metadata.etag = Some(etag.clone());
     }
+    dst_metadata.owner = owner.map(|s| s.to_string());
 
     let _ = storage
         .put_object_metadata(bucket, key, &dst_metadata)

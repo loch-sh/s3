@@ -1,6 +1,7 @@
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use super::{INTERNAL_NAMES, Storage, is_real_dir};
@@ -12,28 +13,60 @@ pub struct BucketInfo {
     pub creation_date: SystemTime,
 }
 
+/// Persisted bucket metadata stored in .metadata.
+#[derive(Serialize, Deserialize)]
+struct BucketMetadata {
+    created: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+}
+
 const METADATA_FILE: &str = ".metadata";
 
 impl Storage {
     /// Create a new bucket directory with a metadata file.
-    pub async fn create_bucket(&self, name: &str) -> Result<(), S3Error> {
+    pub async fn create_bucket(
+        &self,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<(), S3Error> {
         let bucket_path = self.safe_bucket_path(name)?;
-        // Use symlink_metadata to avoid following symlinks
-        if fs::symlink_metadata(&bucket_path).await.is_ok() {
-            return Err(S3Error::BucketAlreadyExists);
+        // Atomic creation: create_dir fails with AlreadyExists, no TOCTOU race
+        match fs::create_dir(&bucket_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(S3Error::BucketAlreadyExists);
+            }
+            Err(e) => return Err(S3Error::InternalError(e.to_string())),
         }
-        fs::create_dir_all(&bucket_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
-        // Write minimal metadata (creation timestamp)
-        let now = format_system_time(SystemTime::now());
-        let metadata = format!("{{\"created\":\"{}\"}}", now);
-        fs::write(bucket_path.join(METADATA_FILE), metadata)
+        let meta = BucketMetadata {
+            created: format_system_time(SystemTime::now()),
+            owner: owner.map(|s| s.to_string()),
+        };
+        let json =
+            serde_json::to_string(&meta).map_err(|e| S3Error::InternalError(e.to_string()))?;
+        fs::write(bucket_path.join(METADATA_FILE), json)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Get the owner of a bucket. Returns None if no owner is recorded (legacy buckets).
+    pub async fn get_bucket_owner(&self, name: &str) -> Result<Option<String>, S3Error> {
+        let bucket_path = self.safe_bucket_path(name)?;
+        let metadata_path = bucket_path.join(METADATA_FILE);
+        match fs::read_to_string(&metadata_path).await {
+            Ok(content) => {
+                if let Ok(meta) = serde_json::from_str::<BucketMetadata>(&content) {
+                    Ok(meta.owner)
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     /// Delete a bucket. Fails if the bucket is not empty.
@@ -115,13 +148,9 @@ impl Storage {
 async fn read_bucket_creation_date(bucket_path: &std::path::Path) -> SystemTime {
     let metadata_path = bucket_path.join(METADATA_FILE);
     if let Ok(content) = fs::read_to_string(&metadata_path).await {
-        if let Some(start) = content.find("\"created\":\"") {
-            let rest = &content[start + 11..];
-            if let Some(end) = rest.find('"') {
-                let date_str = &rest[..end];
-                if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
-                    return dt.to_utc().into();
-                }
+        if let Ok(meta) = serde_json::from_str::<BucketMetadata>(&content) {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&meta.created) {
+                return dt.to_utc().into();
             }
         }
     }

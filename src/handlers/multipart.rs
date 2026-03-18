@@ -125,6 +125,7 @@ pub async fn complete_multipart_upload(
     key: &str,
     upload_id: &str,
     req: Request<Incoming>,
+    owner: Option<&str>,
 ) -> Response<BoxBody> {
     let storage = &config.storage;
     let resource = format!("/{}/{}", bucket, key);
@@ -223,14 +224,17 @@ pub async fn complete_multipart_upload(
                 _ => None,
             };
 
-            // Store encryption metadata if applicable
-            if let Some(ref enc) = encryption_meta {
+            // Store ownership and encryption metadata
+            {
                 let mut stored = storage
                     .get_stored_metadata(bucket, &completed_key)
                     .await
                     .unwrap_or_default();
-                stored.encryption = Some(enc.clone());
-                stored.etag = Some(etag.clone());
+                stored.owner = owner.map(|s| s.to_string());
+                if let Some(ref enc) = encryption_meta {
+                    stored.encryption = Some(enc.clone());
+                    stored.etag = Some(etag.clone());
+                }
                 let _ = storage
                     .put_object_metadata(bucket, &completed_key, &stored)
                     .await;

@@ -5,6 +5,8 @@ use s3::ServerConfig;
 use s3::auth::Credentials;
 use s3::encryption::EncryptionConfig;
 use s3::storage::Storage;
+use s3::users::UserStore;
+use tokio::sync::RwLock;
 
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_UPLOAD_TTL: u64 = 86400; // 24 hours
@@ -14,7 +16,8 @@ struct AppConfig {
     port: u16,
     data_dir: String,
     upload_ttl_secs: u64,
-    credentials: Option<Credentials>,
+    user_store: Option<Arc<RwLock<UserStore>>>,
+    admin_api_key: Option<String>,
     encryption: Option<EncryptionConfig>,
 }
 
@@ -38,7 +41,25 @@ fn parse_env_u64(name: &str, default: u64) -> Result<u64, String> {
     }
 }
 
-fn load_credentials_from_env() -> Result<Option<Credentials>, String> {
+fn load_user_store() -> Result<Option<Arc<RwLock<UserStore>>>, String> {
+    // Priority: S3_USERS_FILE > S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY > None
+    if let Ok(users_file) = std::env::var("S3_USERS_FILE") {
+        let path = std::path::Path::new(&users_file);
+        if path.exists() {
+            let store = UserStore::load_from_file(path)?;
+            return Ok(Some(Arc::new(RwLock::new(store))));
+        }
+        // Bootstrap: generate root user with random credentials
+        let (store, access_key, secret_key) = UserStore::bootstrap(path)?;
+        eprintln!("=============================================================");
+        eprintln!("  Users file not found — bootstrapping with a new root user");
+        eprintln!("  File:              {}", path.display());
+        eprintln!("  Access Key ID:     {}", access_key);
+        eprintln!("  Secret Access Key: stored in the users file (cat {})", path.display());
+        eprintln!("=============================================================");
+        return Ok(Some(Arc::new(RwLock::new(store))));
+    }
+
     let key_id = std::env::var("S3_ACCESS_KEY_ID").ok();
     let secret_key = std::env::var("S3_SECRET_ACCESS_KEY").ok();
     match (key_id, secret_key) {
@@ -50,10 +71,12 @@ fn load_credentials_from_env() -> Result<Option<Credentials>, String> {
                         .to_string(),
                 );
             }
-            Ok(Some(Credentials {
+            let creds = Credentials {
                 access_key_id: key_id,
                 secret_access_key: secret_key,
-            }))
+            };
+            let store = UserStore::from_single_credentials(creds);
+            Ok(Some(Arc::new(RwLock::new(store))))
         }
         _ => Err("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be set together".to_string()),
     }
@@ -83,27 +106,38 @@ fn load_app_config() -> Result<AppConfig, String> {
     let port = parse_env_u16("S3_PORT", DEFAULT_PORT)?;
     let data_dir = std::env::var("S3_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
     let upload_ttl_secs = parse_env_u64("S3_UPLOAD_TTL", DEFAULT_UPLOAD_TTL)?;
-    let credentials = load_credentials_from_env()?;
+    let user_store = load_user_store()?;
+    let admin_api_key = std::env::var("S3_ADMIN_API_KEY").ok().filter(|s| !s.is_empty());
     let encryption = load_encryption_from_env()?;
 
     Ok(AppConfig {
         port,
         data_dir,
         upload_ttl_secs,
-        credentials,
+        user_store,
+        admin_api_key,
         encryption,
     })
 }
 
-fn log_startup(addr: SocketAddr, cfg: &AppConfig) {
+async fn log_startup(addr: SocketAddr, cfg: &AppConfig) {
     eprintln!("S3 server listening on http://{}", addr);
     eprintln!("Data directory: {}", cfg.data_dir);
-    if cfg.credentials.is_some() {
-        eprintln!("Authentication: enabled");
+    if let Some(ref store) = cfg.user_store {
+        let store = store.read().await;
+        eprintln!("Authentication: enabled ({} user(s))", store.len());
+        if store.has_file() {
+            eprintln!("User management API: enabled (/_loch/users)");
+        } else {
+            eprintln!("User management API: disabled (env-var credentials mode)");
+        }
     } else {
         eprintln!(
-            "Authentication: disabled (set S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY to enable)"
+            "Authentication: disabled (set S3_USERS_FILE or S3_ACCESS_KEY_ID + S3_SECRET_ACCESS_KEY to enable)"
         );
+    }
+    if cfg.admin_api_key.is_some() {
+        eprintln!("Admin API key: configured");
     }
     if cfg.encryption.is_some() {
         eprintln!("Encryption: SSE-S3 enabled");
@@ -133,7 +167,8 @@ async fn main() {
 
     let config = Arc::new(ServerConfig {
         storage: storage.clone(),
-        credentials: cfg.credentials.clone(),
+        user_store: cfg.user_store.clone(),
+        admin_api_key: cfg.admin_api_key.clone(),
         upload_ttl_secs: cfg.upload_ttl_secs,
         encryption: cfg.encryption.clone(),
     });
@@ -157,7 +192,7 @@ async fn main() {
         .await
         .expect("Failed to bind address");
 
-    log_startup(addr, &cfg);
+    log_startup(addr, &cfg).await;
 
     tokio::select! {
         _ = s3::serve(listener, config) => {}

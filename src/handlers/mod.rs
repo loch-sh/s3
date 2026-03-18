@@ -4,6 +4,7 @@ pub mod encryption;
 pub mod multipart;
 pub mod object;
 pub mod policy;
+pub mod users;
 pub mod versioning;
 
 use bytes::Bytes;

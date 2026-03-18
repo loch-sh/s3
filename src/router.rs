@@ -5,12 +5,13 @@ use hyper::header::HeaderValue;
 use hyper::{Method, Request, Response, StatusCode};
 
 use crate::ServerConfig;
-use crate::auth;
+use crate::auth::{self, AuthenticatedUser};
 use crate::cors::CorsConfiguration;
 use crate::error::S3Error;
 use crate::handlers::{self, BoxBody, empty_response, full_body, read_body_limited};
 use crate::policy::S3Action;
 use crate::storage::Storage;
+use crate::users::UserStore;
 
 /// Route an incoming HTTP request to the appropriate S3 handler.
 pub async fn route(
@@ -69,7 +70,10 @@ pub async fn route(
     let version_id = query_params.get("versionId").cloned();
     let is_acl_request = query_params.contains_key("acl");
     let is_encryption_request = query_params.contains_key("encryption");
-    let is_management_request = is_policy_request || is_cors_request || is_encryption_request;
+    let is_acl_write = is_acl_request && method == Method::PUT;
+    let is_versioning_write = is_versioning_request && method == Method::PUT;
+    let is_management_request =
+        is_policy_request || is_cors_request || is_encryption_request || is_acl_write || is_versioning_write;
 
     // Handle OPTIONS preflight (no auth required)
     if method == Method::OPTIONS && has_bucket {
@@ -78,9 +82,20 @@ pub async fn route(
         return Ok(response);
     }
 
+    // Route user management API before auth check (uses its own Bearer auth)
+    if path == "/_loch/users" || path.starts_with("/_loch/users/") {
+        let response = handlers::users::route_users_api(req, &config, &path).await;
+        eprintln!("<-- {} {}", response.status().as_u16(), uri);
+        return Ok(response);
+    }
+
     // Check authentication
     let is_presigned = auth::is_presigned_request(&query);
-    let auth_result = auth::verify_request(&req, &config.credentials);
+    let auth_result = auth::verify_request(&req, &config.user_store).await;
+    let caller_user_id: Option<String> = match &auth_result {
+        Ok(Some(user)) => Some(user.user_id.clone()),
+        _ => None,
+    };
     if let Some(deny) = check_auth(
         &auth_result,
         &config,
@@ -166,6 +181,7 @@ pub async fn route(
             has_part_number,
             req,
             origin.as_deref(),
+            caller_user_id.as_deref(),
         )
         .await
         {
@@ -267,7 +283,8 @@ pub async fn route(
 
         // PUT /{bucket} — CreateBucket
         (&Method::PUT, true, false) => {
-            handlers::bucket::create_bucket(storage.clone(), &bucket).await
+            handlers::bucket::create_bucket(storage.clone(), &bucket, caller_user_id.as_deref())
+                .await
         }
 
         // HEAD /{bucket} — HeadBucket
@@ -294,7 +311,7 @@ pub async fn route(
                 // allowed the PUT), also verify that the source bucket/key allows anonymous
                 // GET. Without this check, an anonymous user could copy private objects into
                 // a world-writable bucket.
-                if auth_result.is_err() {
+                if config.user_store.is_some() && !matches!(&auth_result, Ok(Some(_))) {
                     let src = source.trim_start_matches('/');
                     let src_path = src.split('?').next().unwrap_or(src);
                     if let Some(sep) = src_path.find('/') {
@@ -332,9 +349,24 @@ pub async fn route(
                     }
                 }
 
-                handlers::object::copy_object(config.clone(), &bucket, &key, &source, req).await
+                handlers::object::copy_object(
+                    config.clone(),
+                    &bucket,
+                    &key,
+                    &source,
+                    req,
+                    caller_user_id.as_deref(),
+                )
+                .await
             } else {
-                handlers::object::put_object(config.clone(), &bucket, &key, req).await
+                handlers::object::put_object(
+                    config.clone(),
+                    &bucket,
+                    &key,
+                    req,
+                    caller_user_id.as_deref(),
+                )
+                .await
             }
         }
 
@@ -373,9 +405,9 @@ pub async fn route(
     Ok(response)
 }
 
-/// Check authentication. Returns Some(response) if the request should be denied.
+/// Check authentication and authorization. Returns Some(response) if the request should be denied.
 async fn check_auth(
-    auth_result: &Result<(), S3Error>,
+    auth_result: &Result<Option<AuthenticatedUser>, S3Error>,
     config: &ServerConfig,
     storage: &Storage,
     method: &Method,
@@ -387,45 +419,127 @@ async fn check_auth(
     is_management_request: bool,
     is_presigned: bool,
 ) -> Option<Response<BoxBody>> {
-    let auth_err = match auth_result {
-        Err(e) => e,
-        Ok(()) => return None,
-    };
-
-    if config.credentials.is_none() {
+    // No user store configured: open access
+    if config.user_store.is_none() {
         return None;
     }
 
-    // Presigned URL auth failure: deny immediately, no anonymous fallback
-    if is_presigned {
-        return Some(handlers::error_response(auth_err.clone(), path));
-    }
+    match auth_result {
+        // Authenticated user
+        Ok(Some(user)) => {
+            // Root user: allow everything
+            if user.is_root {
+                return None;
+            }
 
-    // Management endpoints always require auth
-    if is_management_request || !has_bucket {
-        return Some(handlers::error_response(auth_err.clone(), path));
-    }
+            // Check if user is bucket owner (if we have a bucket)
+            if has_bucket {
+                let owner = match storage.get_bucket_owner(bucket).await {
+                    Ok(o) => o,
+                    Err(e) => return Some(handlers::error_response(e, path)),
+                };
+                if owner.as_deref() == Some(&user.user_id) {
+                    return None; // bucket owner has full access
+                }
+            }
 
-    // Bucket create/delete require admin access
-    if !has_key && (*method == Method::PUT || *method == Method::DELETE) {
-        return Some(handlers::error_response(auth_err.clone(), path));
-    }
+            // Management endpoints: only root or bucket owner (already checked above)
+            if is_management_request {
+                return Some(handlers::error_response(S3Error::AccessDenied, path));
+            }
 
-    // For data endpoints, check bucket policy and ACLs for anonymous access
-    let action = determine_action(method, has_key);
-    let allowed = if let Some(action) = action {
-        let policy_ok = check_anonymous_access(storage, bucket, key, action).await;
-        let acl_ok = check_acl_anonymous(storage, bucket, key, has_key, method).await;
-        policy_ok || acl_ok
-    } else {
-        false
+            // Bucket create: any authenticated user can create
+            if !has_key && *method == Method::PUT && has_bucket {
+                return None;
+            }
+
+            // Bucket delete: only root or owner (already checked)
+            if !has_key && *method == Method::DELETE {
+                return Some(handlers::error_response(S3Error::AccessDenied, path));
+            }
+
+            // ListBuckets: any authenticated user
+            if !has_bucket {
+                return None;
+            }
+
+            // For data endpoints, check bucket policy for this user
+            let action = determine_action(method, has_key);
+            if let Some(action) = action {
+                let user_arn = UserStore::arn_for(&user.user_id);
+                if check_user_access(storage, bucket, key, action, &user_arn).await {
+                    return None;
+                }
+            }
+
+            Some(handlers::error_response(S3Error::AccessDenied, path))
+        }
+
+        // verify_request only returns Ok(None) when user_store is None,
+        // which is already handled at the top. Deny defensively.
+        Ok(None) => Some(handlers::error_response(S3Error::AccessDenied, path)),
+
+        // Auth error (bad signature, expired, etc.)
+        Err(auth_err) => {
+            // Presigned URL auth failure: deny immediately, no anonymous fallback
+            if is_presigned {
+                return Some(handlers::error_response(auth_err.clone(), path));
+            }
+
+            // Management endpoints always require auth
+            if is_management_request || !has_bucket {
+                return Some(handlers::error_response(auth_err.clone(), path));
+            }
+
+            // Bucket create/delete require auth
+            if !has_key && (*method == Method::PUT || *method == Method::DELETE) {
+                return Some(handlers::error_response(auth_err.clone(), path));
+            }
+
+            // For data endpoints, check bucket policy and ACLs for anonymous access
+            let action = determine_action(method, has_key);
+            let allowed = if let Some(action) = action {
+                let policy_ok = check_anonymous_access(storage, bucket, key, action).await;
+                let acl_ok = check_acl_anonymous(storage, bucket, key, has_key, method).await;
+                policy_ok || acl_ok
+            } else {
+                false
+            };
+
+            if !allowed {
+                Some(handlers::error_response(auth_err.clone(), path))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Check if the bucket policy allows access for a specific user ARN.
+async fn check_user_access(
+    storage: &Storage,
+    bucket: &str,
+    key: &str,
+    action: S3Action,
+    user_arn: &str,
+) -> bool {
+    let policy_data = match storage.get_bucket_policy(bucket).await {
+        Ok(data) => data,
+        Err(_) => return false,
     };
 
-    if !allowed {
-        Some(handlers::error_response(auth_err.clone(), path))
+    let policy: crate::policy::BucketPolicy = match serde_json::from_slice(&policy_data) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let resource = if key.is_empty() {
+        format!("arn:aws:s3:::{}", bucket)
     } else {
-        None
-    }
+        format!("arn:aws:s3:::{}/{}", bucket, key)
+    };
+
+    policy.is_allowed_for_user(user_arn, action, &resource)
 }
 
 /// Try to route a multipart upload operation.
@@ -441,6 +555,7 @@ async fn route_multipart(
     has_part_number: Option<&String>,
     req: Request<Incoming>,
     origin: Option<&str>,
+    owner: Option<&str>,
 ) -> Result<Response<BoxBody>, Request<Incoming>> {
     let storage = &config.storage;
 
@@ -480,6 +595,7 @@ async fn route_multipart(
                 key,
                 upload_id,
                 req,
+                owner,
             )
             .await;
             return Ok(maybe_add_cors_headers(response, storage, bucket, method, origin).await);

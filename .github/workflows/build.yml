@@ -1,0 +1,82 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            suffix: linux-amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            suffix: linux-arm64
+          - target: x86_64-pc-windows-gnu
+            runner: ubuntu-latest
+            suffix: windows-amd64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            suffix: macos-amd64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            suffix: macos-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cross (Linux targets)
+        if: matrix.runner == 'ubuntu-latest'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cross)
+        if: matrix.runner == 'ubuntu-latest'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: matrix.runner == 'macos-latest'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Determine branch name
+        id: branch
+        run: |
+          ref="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          echo "name=$(echo "$ref" | sed 's/[^a-zA-Z0-9._-]/-/g')" >> "$GITHUB_OUTPUT"
+
+      - name: Archive (Linux / macOS)
+        if: "!contains(matrix.target, 'windows')"
+        run: tar czf s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}.tar.gz -C target/${{ matrix.target }}/release s3
+
+      - name: Archive (Windows)
+        if: contains(matrix.target, 'windows')
+        run: zip s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}.zip target/${{ matrix.target }}/release/s3.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}
+          path: |
+            s3-*.tar.gz
+            s3-*.zip

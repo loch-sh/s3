@@ -27,6 +27,7 @@ pub enum S3Error {
     MissingSecurityHeader,
     InvalidArgument(String),
     ServerSideEncryptionConfigurationNotFoundError,
+    InvalidAccessKeyId,
     InternalError(String),
 }
 
@@ -149,6 +150,11 @@ impl S3Error {
                 "ServerSideEncryptionConfigurationNotFoundError",
                 StatusCode::BAD_REQUEST,
                 "Server-side encryption is not configured on this server.",
+            ),
+            S3Error::InvalidAccessKeyId => (
+                "InvalidAccessKeyId",
+                StatusCode::FORBIDDEN,
+                "The AWS access key ID you provided does not exist in our records.",
             ),
             S3Error::InternalError(msg) => {
                 let _ = msg;

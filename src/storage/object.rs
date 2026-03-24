@@ -37,6 +37,9 @@ pub struct StoredMetadata {
     /// Plaintext ETag (stored for encrypted objects since it cannot be recomputed from ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    /// User ID of the object owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// Object metadata returned by head_object and get_object_meta.

@@ -1,17 +1,29 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use hyper::Request;
 use hyper::body::Incoming;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tokio::sync::RwLock;
 
 use crate::error::S3Error;
+use crate::users::UserStore;
 
-/// Credentials for S3 authentication.
+/// Credentials for S3 authentication (used for backward-compatible env-var config).
 #[derive(Clone)]
 pub struct Credentials {
     pub access_key_id: String,
     pub secret_access_key: String,
+}
+
+/// The identity of an authenticated user, returned by verify_request.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedUser {
+    pub user_id: String,
+    pub display_name: String,
+    pub is_root: bool,
 }
 
 /// Returns true if the request uses presigned URL (query-string) authentication.
@@ -20,29 +32,32 @@ pub fn is_presigned_request(query: &str) -> bool {
 }
 
 /// Verify the AWS Signature Version 4 on an incoming request.
-/// Handles both Authorization-header auth and presigned URL (query-string) auth.
-/// Returns Ok(()) if the signature is valid, or an S3Error otherwise.
-/// If no credentials are configured, all requests are allowed.
-pub fn verify_request(
+/// Returns Ok(Some(user)) if authenticated, Ok(None) if no user store configured (open access),
+/// or Err if auth headers are present but invalid.
+pub async fn verify_request(
     req: &Request<Incoming>,
-    credentials: &Option<Credentials>,
-) -> Result<(), S3Error> {
-    let creds = match credentials {
-        Some(c) => c,
-        None => return Ok(()),
+    user_store: &Option<Arc<RwLock<UserStore>>>,
+) -> Result<Option<AuthenticatedUser>, S3Error> {
+    let store = match user_store {
+        Some(s) => s,
+        None => return Ok(None),
     };
 
+    let store = store.read().await;
     let query = req.uri().query().unwrap_or("");
     if is_presigned_request(query) {
-        verify_presigned(req, creds, query)
+        verify_presigned(req, &store, query)
     } else {
-        verify_header_auth(req, creds)
+        verify_header_auth(req, &store)
     }
 }
 
 // ---- Header-based auth ----
 
-fn verify_header_auth(req: &Request<Incoming>, creds: &Credentials) -> Result<(), S3Error> {
+fn verify_header_auth(
+    req: &Request<Incoming>,
+    store: &UserStore,
+) -> Result<Option<AuthenticatedUser>, S3Error> {
     let auth_header = req
         .headers()
         .get("authorization")
@@ -51,9 +66,9 @@ fn verify_header_auth(req: &Request<Incoming>, creds: &Credentials) -> Result<()
 
     let parsed = parse_auth_header(auth_header).ok_or(S3Error::AccessDenied)?;
 
-    if parsed.access_key_id != creds.access_key_id {
-        return Err(S3Error::AccessDenied);
-    }
+    let user = store
+        .lookup_by_access_key(parsed.access_key_id)
+        .ok_or(S3Error::InvalidAccessKeyId)?;
 
     let amz_date = resolve_amz_date(req)?;
     validate_request_time(&amz_date)?;
@@ -85,15 +100,25 @@ fn verify_header_auth(req: &Request<Incoming>, creds: &Credentials) -> Result<()
         amz_date, parsed.scope, canonical_req_hash
     );
 
-    let signing_key = derive_signing_key(&creds.secret_access_key, date_stamp, region, service);
+    let signing_key = derive_signing_key(&user.secret_access_key, date_stamp, region, service);
     let expected = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
 
-    verify_signature(&expected, parsed.signature)
+    verify_signature(&expected, parsed.signature)?;
+
+    Ok(Some(AuthenticatedUser {
+        user_id: user.user_id.clone(),
+        display_name: user.display_name.clone(),
+        is_root: user.is_root,
+    }))
 }
 
 // ---- Presigned URL auth ----
 
-fn verify_presigned(req: &Request<Incoming>, creds: &Credentials, query: &str) -> Result<(), S3Error> {
+fn verify_presigned(
+    req: &Request<Incoming>,
+    store: &UserStore,
+    query: &str,
+) -> Result<Option<AuthenticatedUser>, S3Error> {
     let mut algorithm = None::<String>;
     let mut credential = None::<String>;
     let mut amz_date = None::<String>;
@@ -132,9 +157,9 @@ fn verify_presigned(req: &Request<Incoming>, creds: &Credentials, query: &str) -
 
     // credential = AKID/DATE/REGION/SERVICE/aws4_request
     let (access_key_id, scope) = credential.split_once('/').ok_or(S3Error::AccessDenied)?;
-    if access_key_id != creds.access_key_id {
-        return Err(S3Error::AccessDenied);
-    }
+    let user = store
+        .lookup_by_access_key(access_key_id)
+        .ok_or(S3Error::InvalidAccessKeyId)?;
 
     let scope_parts: Vec<&str> = scope.split('/').collect();
     if scope_parts.len() != 4 || scope_parts[2] != "s3" || scope_parts[3] != "aws4_request" {
@@ -158,10 +183,16 @@ fn verify_presigned(req: &Request<Incoming>, creds: &Credentials, query: &str) -
         amz_date, scope, canonical_req_hash
     );
 
-    let signing_key = derive_signing_key(&creds.secret_access_key, date_stamp, region, service);
+    let signing_key = derive_signing_key(&user.secret_access_key, date_stamp, region, service);
     let expected = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
 
-    verify_signature(&expected, &signature)
+    verify_signature(&expected, &signature)?;
+
+    Ok(Some(AuthenticatedUser {
+        user_id: user.user_id.clone(),
+        display_name: user.display_name.clone(),
+        is_root: user.is_root,
+    }))
 }
 
 /// Maximum allowed presigned URL validity (7 days), matching AWS S3.

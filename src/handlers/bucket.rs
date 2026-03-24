@@ -8,8 +8,12 @@ use crate::storage::bucket::format_system_time;
 use crate::xml::{self, BucketEntry, ListAllMyBucketsResult};
 
 /// PUT /{bucket} — Create a new bucket.
-pub async fn create_bucket(storage: Arc<Storage>, bucket: &str) -> Response<BoxBody> {
-    match storage.create_bucket(bucket).await {
+pub async fn create_bucket(
+    storage: Arc<Storage>,
+    bucket: &str,
+    owner: Option<&str>,
+) -> Response<BoxBody> {
+    match storage.create_bucket(bucket, owner).await {
         Ok(()) => {
             let location = format!("/{}", bucket);
             Response::builder()

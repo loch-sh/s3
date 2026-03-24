@@ -6,23 +6,26 @@ pub mod handlers;
 pub mod policy;
 pub mod router;
 pub mod storage;
+pub mod users;
 pub mod xml;
 
 use std::sync::Arc;
 
-use auth::Credentials;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 
 use encryption::EncryptionConfig;
 use storage::Storage;
+use users::UserStore;
 
 /// Server configuration shared across all connections.
 pub struct ServerConfig {
     pub storage: Arc<Storage>,
-    pub credentials: Option<Credentials>,
+    pub user_store: Option<Arc<RwLock<UserStore>>>,
+    pub admin_api_key: Option<String>,
     pub upload_ttl_secs: u64,
     pub encryption: Option<EncryptionConfig>,
 }

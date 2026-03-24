@@ -49,13 +49,22 @@ fn load_user_store() -> Result<Option<Arc<RwLock<UserStore>>>, String> {
             let store = UserStore::load_from_file(path)?;
             return Ok(Some(Arc::new(RwLock::new(store))));
         }
+        // Ensure parent directory exists before bootstrapping
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("Failed to create directory '{}': {}", parent.display(), e)
+            })?;
+        }
         // Bootstrap: generate root user with random credentials
-        let (store, access_key, secret_key) = UserStore::bootstrap(path)?;
+        let (store, access_key, _secret_key) = UserStore::bootstrap(path)?;
         eprintln!("=============================================================");
         eprintln!("  Users file not found — bootstrapping with a new root user");
         eprintln!("  File:              {}", path.display());
         eprintln!("  Access Key ID:     {}", access_key);
-        eprintln!("  Secret Access Key: stored in the users file (cat {})", path.display());
+        eprintln!(
+            "  Secret Access Key: stored in the users file (cat {})",
+            path.display()
+        );
         eprintln!("=============================================================");
         return Ok(Some(Arc::new(RwLock::new(store))));
     }
@@ -107,7 +116,9 @@ fn load_app_config() -> Result<AppConfig, String> {
     let data_dir = std::env::var("S3_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
     let upload_ttl_secs = parse_env_u64("S3_UPLOAD_TTL", DEFAULT_UPLOAD_TTL)?;
     let user_store = load_user_store()?;
-    let admin_api_key = std::env::var("S3_ADMIN_API_KEY").ok().filter(|s| !s.is_empty());
+    let admin_api_key = std::env::var("S3_ADMIN_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
     let encryption = load_encryption_from_env()?;
 
     Ok(AppConfig {

@@ -130,7 +130,9 @@ impl UserStore {
     /// Add or update a user. Validates uniqueness. Persists to file.
     pub async fn add_user(&mut self, record: UserRecord) -> Result<(), S3Error> {
         if record.user_id.is_empty() {
-            return Err(S3Error::InvalidArgument("user_id must not be empty".to_string()));
+            return Err(S3Error::InvalidArgument(
+                "user_id must not be empty".to_string(),
+            ));
         }
         if record.access_key_id.is_empty() || record.secret_access_key.is_empty() {
             return Err(S3Error::InvalidArgument(
@@ -167,8 +169,7 @@ impl UserStore {
 
         self.by_access_key
             .insert(record.access_key_id.clone(), record.clone());
-        self.by_user_id
-            .insert(record.user_id.clone(), record);
+        self.by_user_id.insert(record.user_id.clone(), record);
 
         self.save_to_file().await?;
         Ok(())
@@ -281,7 +282,7 @@ impl UserStore {
 
 /// Generate a random alphanumeric key of the given length (uniform, no modulo bias).
 fn generate_key(len: usize) -> String {
-    use rand::{Rng, RngExt};
+    use rand::RngExt;
     use rand::distr::Alphanumeric;
     rand::rng()
         .sample_iter(Alphanumeric)
@@ -380,10 +381,7 @@ mod tests {
 
     #[test]
     fn test_arn_for() {
-        assert_eq!(
-            UserStore::arn_for("alice"),
-            "arn:loch:iam:::user/alice"
-        );
+        assert_eq!(UserStore::arn_for("alice"), "arn:loch:iam:::user/alice");
     }
 
     #[test]

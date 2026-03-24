@@ -50,11 +50,11 @@ jobs:
 
       - name: Archive (Linux / macOS)
         if: "!contains(matrix.target, 'windows')"
-        run: tar czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release s3
+        run: tar czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release s3 loch-s3
 
       - name: Archive (Windows)
         if: contains(matrix.target, 'windows')
-        run: zip ${{ matrix.archive }} target/${{ matrix.target }}/release/s3.exe
+        run: zip ${{ matrix.archive }} target/${{ matrix.target }}/release/s3.exe target/${{ matrix.target }}/release/loch-s3.exe
 
       - uses: actions/upload-artifact@v4
         with:

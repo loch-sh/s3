@@ -4633,3 +4633,179 @@ async fn test_anonymous_denied_when_users_configured() {
 
     cleanup(&tmp_dir);
 }
+
+// --- CLI tests ---
+
+fn loch_s3_bin() -> std::path::PathBuf {
+    std::env::var("CARGO_BIN_EXE_loch-s3")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let mut p = std::env::current_exe().expect("cannot determine test binary path");
+            p.pop();
+            if p.ends_with("deps") {
+                p.pop();
+            }
+            // Unix only: no .exe suffix needed
+            p.push("loch-s3");
+            p
+        })
+}
+
+#[tokio::test]
+async fn test_cli_users_list() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "list"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+
+    assert!(
+        output.status.success(),
+        "exit code: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+    let users = parsed["users"].as_array().expect("response must have a 'users' array");
+    assert!(!users.is_empty(), "expected at least one user");
+    for u in users {
+        assert!(u.get("secret_access_key").is_none(), "secret key leaked");
+    }
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cli_users_get() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "get", "alice"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("stdout is valid JSON");
+    assert_eq!(parsed["user_id"], "alice");
+    assert_eq!(parsed["display_name"], "Alice");
+    assert!(parsed.get("secret_access_key").is_none());
+
+    // Non-existent user must exit with code 1
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "get", "nobody"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    assert!(!output.status.success());
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cli_users_put_and_delete() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    // Create user
+    let output = tokio::process::Command::new(&bin)
+        .args([
+            "--server", &base_url,
+            "--api-key", ADMIN_API_KEY,
+            "users", "put", "dave",
+            "--display-name", "Dave",
+            "--access-key", "AKIADAVE00000001",
+            "--secret-key", "DaveSecretKey123456789012345678",
+        ])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify it appears in list
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "list"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("stdout is valid JSON");
+    let ids: Vec<&str> = parsed["users"]
+        .as_array()
+        .expect("response must have a 'users' array")
+        .iter()
+        .map(|u| u["user_id"].as_str().expect("user_id is a string"))
+        .collect();
+    assert!(ids.contains(&"dave"));
+
+    // Delete user
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "delete", "dave"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    assert!(output.status.success());
+
+    // Verify deleted
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "get", "dave"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    assert!(!output.status.success());
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cli_users_wrong_api_key() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", "wrong-key", "users", "list"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("403"), "expected 403 in stderr, got: {}", stderr);
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cli_users_env_vars() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    let output = tokio::process::Command::new(&bin)
+        .env("LOCH_SERVER", &base_url)
+        .env("LOCH_ADMIN_KEY", ADMIN_API_KEY)
+        .args(["users", "list"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("stdout is valid JSON");
+    assert!(
+        !parsed["users"].as_array().expect("response must have a 'users' array").is_empty(),
+        "expected at least one user"
+    );
+
+    cleanup(&tmp_dir);
+}

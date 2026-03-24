@@ -84,6 +84,51 @@ User management API, protected by `S3_ADMIN_API_KEY` (Bearer token). Only availa
 | CreateOrUpdateUser | `PUT`    | `/_loch/users/{user_id}` | Create or update a user (root cannot be modified)    |
 | DeleteUser         | `DELETE` | `/_loch/users/{user_id}` | Delete a user (root cannot be deleted)               |
 
+## CLI: `loch-s3`
+
+`loch-s3` is a command-line tool for managing users via the admin API. It is distributed alongside the `s3` server binary (releases, Docker image).
+
+### Configuration
+
+| Flag / Env var              | Default                 | Description                  |
+| --------------------------- | ----------------------- | ---------------------------- |
+| `--server` / `LOCH_SERVER`  | `http://localhost:8080` | Server URL                   |
+| `--api-key` / `LOCH_ADMIN_KEY` | _(required)_         | Admin API key (Bearer token) |
+
+Flags take precedence over environment variables.
+
+### Commands
+
+```bash
+# List all users
+loch-s3 users list
+
+# Get a specific user
+loch-s3 users get <user_id>
+
+# Create or update a user
+loch-s3 users put <user_id> \
+  --display-name "Alice" \
+  --access-key AKIAALICE00000000 \
+  --secret-key "AliceSecretKey..."
+
+# Delete a user
+loch-s3 users delete <user_id>
+```
+
+All commands output pretty-printed JSON on stdout. Errors print the HTTP error body to stderr and exit with code 1.
+
+### With Docker
+
+Both `s3` and `loch-s3` are included in the Docker image:
+
+```bash
+docker exec <container> loch-s3 \
+  --server http://localhost:8080 \
+  --api-key "$S3_ADMIN_API_KEY" \
+  users list
+```
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) 1.85+ (for building from source)

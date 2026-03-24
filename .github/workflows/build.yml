@@ -67,11 +67,11 @@ jobs:
 
       - name: Archive (Linux / macOS)
         if: "!contains(matrix.target, 'windows')"
-        run: tar czf s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}.tar.gz -C target/${{ matrix.target }}/release s3
+        run: tar czf s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}.tar.gz -C target/${{ matrix.target }}/release s3 loch-s3
 
       - name: Archive (Windows)
         if: contains(matrix.target, 'windows')
-        run: zip s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}.zip target/${{ matrix.target }}/release/s3.exe
+        run: zip s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}.zip target/${{ matrix.target }}/release/s3.exe target/${{ matrix.target }}/release/loch-s3.exe
 
       - uses: actions/upload-artifact@v4
         with:

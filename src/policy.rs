@@ -199,10 +199,13 @@ impl Statement {
 
 /// Check if an ARN pattern matches a resource.
 /// Supports trailing "*" wildcard.
+/// Accepts `arn:aws:s3:::` as an alias for `arn:loch:s3:::` for AWS tool compatibility.
 fn resource_matches(pattern: &str, resource: &str) -> bool {
     if pattern == "*" {
         return true;
     }
+    let pattern = pattern.replace("arn:aws:s3:::", "arn:loch:s3:::");
+    let resource = resource.replace("arn:aws:s3:::", "arn:loch:s3:::");
     if let Some(prefix) = pattern.strip_suffix('*') {
         resource.starts_with(prefix)
     } else {
@@ -239,7 +242,7 @@ mod tests {
                 "Effect": "Allow",
                 "Principal": "*",
                 "Action": "s3:GetObject",
-                "Resource": "arn:aws:s3:::my-bucket/*"
+                "Resource": "arn:loch:s3:::my-bucket/*"
             }]
         }"#;
         let policy = parse_policy(json.as_bytes()).unwrap();
@@ -270,20 +273,20 @@ mod tests {
                 "Effect": "Allow",
                 "Principal": "*",
                 "Action": ["s3:GetObject", "s3:ListBucket"],
-                "Resource": ["arn:aws:s3:::bucket", "arn:aws:s3:::bucket/*"]
+                "Resource": ["arn:loch:s3:::bucket", "arn:loch:s3:::bucket/*"]
             }]
         }"#;
         let policy = parse_policy(json.as_bytes()).unwrap();
         assert!(
-            policy.is_allowed_for_anonymous(S3Action::GetObject, "arn:aws:s3:::bucket/file.txt")
+            policy.is_allowed_for_anonymous(S3Action::GetObject, "arn:loch:s3:::bucket/file.txt")
         );
-        assert!(policy.is_allowed_for_anonymous(S3Action::ListBucket, "arn:aws:s3:::bucket"));
+        assert!(policy.is_allowed_for_anonymous(S3Action::ListBucket, "arn:loch:s3:::bucket"));
         assert!(
-            !policy.is_allowed_for_anonymous(S3Action::PutObject, "arn:aws:s3:::bucket/file.txt")
+            !policy.is_allowed_for_anonymous(S3Action::PutObject, "arn:loch:s3:::bucket/file.txt")
         );
         assert!(
             !policy
-                .is_allowed_for_anonymous(S3Action::DeleteObject, "arn:aws:s3:::bucket/file.txt")
+                .is_allowed_for_anonymous(S3Action::DeleteObject, "arn:loch:s3:::bucket/file.txt")
         );
     }
 
@@ -292,17 +295,17 @@ mod tests {
         let json = r#"{
             "Version": "2012-10-17",
             "Statement": [
-                {"Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::bucket/*"},
-                {"Effect": "Deny", "Principal": "*", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::bucket/*"}
+                {"Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": "arn:loch:s3:::bucket/*"},
+                {"Effect": "Deny", "Principal": "*", "Action": "s3:DeleteObject", "Resource": "arn:loch:s3:::bucket/*"}
             ]
         }"#;
         let policy = parse_policy(json.as_bytes()).unwrap();
         assert!(
-            policy.is_allowed_for_anonymous(S3Action::GetObject, "arn:aws:s3:::bucket/file.txt")
+            policy.is_allowed_for_anonymous(S3Action::GetObject, "arn:loch:s3:::bucket/file.txt")
         );
         assert!(
             !policy
-                .is_allowed_for_anonymous(S3Action::DeleteObject, "arn:aws:s3:::bucket/file.txt")
+                .is_allowed_for_anonymous(S3Action::DeleteObject, "arn:loch:s3:::bucket/file.txt")
         );
     }
 
@@ -318,8 +321,8 @@ mod tests {
             }]
         }"#;
         let policy = parse_policy(json.as_bytes()).unwrap();
-        assert!(policy.is_allowed_for_anonymous(S3Action::GetObject, "arn:aws:s3:::anything/key"));
-        assert!(policy.is_allowed_for_anonymous(S3Action::PutObject, "arn:aws:s3:::anything/key"));
+        assert!(policy.is_allowed_for_anonymous(S3Action::GetObject, "arn:loch:s3:::anything/key"));
+        assert!(policy.is_allowed_for_anonymous(S3Action::PutObject, "arn:loch:s3:::anything/key"));
     }
 
     #[test]
@@ -330,20 +333,20 @@ mod tests {
                 "Effect": "Allow",
                 "Principal": "*",
                 "Action": "s3:GetObject",
-                "Resource": "arn:aws:s3:::bucket/public/*"
+                "Resource": "arn:loch:s3:::bucket/public/*"
             }]
         }"#;
         let policy = parse_policy(json.as_bytes()).unwrap();
         assert!(
             policy.is_allowed_for_anonymous(
                 S3Action::GetObject,
-                "arn:aws:s3:::bucket/public/file.txt"
+                "arn:loch:s3:::bucket/public/file.txt"
             )
         );
         assert!(
             !policy.is_allowed_for_anonymous(
                 S3Action::GetObject,
-                "arn:aws:s3:::bucket/private/file.txt"
+                "arn:loch:s3:::bucket/private/file.txt"
             )
         );
     }
@@ -356,24 +359,24 @@ mod tests {
                 "Effect": "Allow",
                 "Principal": {"AWS": "arn:loch:iam:::user/alice"},
                 "Action": "s3:GetObject",
-                "Resource": "arn:aws:s3:::bucket/*"
+                "Resource": "arn:loch:s3:::bucket/*"
             }]
         }"#;
         let policy = parse_policy(json.as_bytes()).unwrap();
         assert!(policy.is_allowed_for_user(
             "arn:loch:iam:::user/alice",
             S3Action::GetObject,
-            "arn:aws:s3:::bucket/file.txt"
+            "arn:loch:s3:::bucket/file.txt"
         ));
         assert!(!policy.is_allowed_for_user(
             "arn:loch:iam:::user/bob",
             S3Action::GetObject,
-            "arn:aws:s3:::bucket/file.txt"
+            "arn:loch:s3:::bucket/file.txt"
         ));
         // Anonymous should not match specific principal
         assert!(!policy.is_allowed_for_anonymous(
             S3Action::GetObject,
-            "arn:aws:s3:::bucket/file.txt"
+            "arn:loch:s3:::bucket/file.txt"
         ));
     }
 
@@ -385,24 +388,24 @@ mod tests {
                 "Effect": "Allow",
                 "Principal": {"AWS": ["arn:loch:iam:::user/alice", "arn:loch:iam:::user/bob"]},
                 "Action": "s3:GetObject",
-                "Resource": "arn:aws:s3:::bucket/*"
+                "Resource": "arn:loch:s3:::bucket/*"
             }]
         }"#;
         let policy = parse_policy(json.as_bytes()).unwrap();
         assert!(policy.is_allowed_for_user(
             "arn:loch:iam:::user/alice",
             S3Action::GetObject,
-            "arn:aws:s3:::bucket/file.txt"
+            "arn:loch:s3:::bucket/file.txt"
         ));
         assert!(policy.is_allowed_for_user(
             "arn:loch:iam:::user/bob",
             S3Action::GetObject,
-            "arn:aws:s3:::bucket/file.txt"
+            "arn:loch:s3:::bucket/file.txt"
         ));
         assert!(!policy.is_allowed_for_user(
             "arn:loch:iam:::user/charlie",
             S3Action::GetObject,
-            "arn:aws:s3:::bucket/file.txt"
+            "arn:loch:s3:::bucket/file.txt"
         ));
     }
 
@@ -411,20 +414,20 @@ mod tests {
         let json = r#"{
             "Version": "2012-10-17",
             "Statement": [
-                {"Effect": "Allow", "Principal": {"AWS": "arn:loch:iam:::user/alice"}, "Action": "s3:*", "Resource": "arn:aws:s3:::bucket/*"},
-                {"Effect": "Deny", "Principal": {"AWS": "arn:loch:iam:::user/alice"}, "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::bucket/*"}
+                {"Effect": "Allow", "Principal": {"AWS": "arn:loch:iam:::user/alice"}, "Action": "s3:*", "Resource": "arn:loch:s3:::bucket/*"},
+                {"Effect": "Deny", "Principal": {"AWS": "arn:loch:iam:::user/alice"}, "Action": "s3:DeleteObject", "Resource": "arn:loch:s3:::bucket/*"}
             ]
         }"#;
         let policy = parse_policy(json.as_bytes()).unwrap();
         assert!(policy.is_allowed_for_user(
             "arn:loch:iam:::user/alice",
             S3Action::GetObject,
-            "arn:aws:s3:::bucket/file.txt"
+            "arn:loch:s3:::bucket/file.txt"
         ));
         assert!(!policy.is_allowed_for_user(
             "arn:loch:iam:::user/alice",
             S3Action::DeleteObject,
-            "arn:aws:s3:::bucket/file.txt"
+            "arn:loch:s3:::bucket/file.txt"
         ));
     }
 }

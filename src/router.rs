@@ -542,9 +542,9 @@ async fn check_user_access(
     };
 
     let resource = if key.is_empty() {
-        format!("arn:aws:s3:::{}", bucket)
+        format!("arn:loch:s3:::{}", bucket)
     } else {
-        format!("arn:aws:s3:::{}/{}", bucket, key)
+        format!("arn:loch:s3:::{}/{}", bucket, key)
     };
 
     policy.is_allowed_for_user(user_arn, action, &resource)
@@ -673,9 +673,9 @@ async fn check_anonymous_access(
 
     // Build the ARN-style resource string
     let resource = if key.is_empty() {
-        format!("arn:aws:s3:::{}", bucket)
+        format!("arn:loch:s3:::{}", bucket)
     } else {
-        format!("arn:aws:s3:::{}/{}", bucket, key)
+        format!("arn:loch:s3:::{}/{}", bucket, key)
     };
 
     policy.is_allowed_for_anonymous(action, &resource)

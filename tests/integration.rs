@@ -1278,7 +1278,7 @@ async fn test_presigned_url_no_anonymous_fallback() {
 
     let policy_json = r#"{
         "Version": "2012-10-17",
-        "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pub-presigned/*"}]
+        "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:loch:s3:::pub-presigned/*"}]
     }"#;
     let req = sign_request(
         client
@@ -1346,7 +1346,7 @@ async fn test_policy_crud() {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:GetObject",
-            "Resource": "arn:aws:s3:::policy-bucket/*"
+            "Resource": "arn:loch:s3:::policy-bucket/*"
         }]
     }"#;
     let req = sign_request(
@@ -1461,7 +1461,7 @@ async fn test_policy_public_read() {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:GetObject",
-            "Resource": "arn:aws:s3:::pub-bucket/*"
+            "Resource": "arn:loch:s3:::pub-bucket/*"
         }]
     }"#;
     let req = sign_request(
@@ -1540,7 +1540,7 @@ async fn test_policy_no_admin_access() {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:GetObject",
-            "Resource": "arn:aws:s3:::admin-bucket/*"
+            "Resource": "arn:loch:s3:::admin-bucket/*"
         }]
     }"#;
     let req = sign_request(
@@ -1625,7 +1625,7 @@ async fn test_policy_public_list() {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:ListBucket",
-            "Resource": "arn:aws:s3:::list-bucket"
+            "Resource": "arn:loch:s3:::list-bucket"
         }]
     }"#;
     let req = sign_request(
@@ -4453,7 +4453,7 @@ async fn test_multi_user_policy_grant() {
             "Effect": "Allow",
             "Principal": {"AWS": "arn:loch:iam:::user/bob"},
             "Action": "s3:GetObject",
-            "Resource": "arn:aws:s3:::shared-bucket/*"
+            "Resource": "arn:loch:s3:::shared-bucket/*"
         }]
     });
     let policy_bytes = serde_json::to_vec(&policy).unwrap();
@@ -4897,7 +4897,7 @@ async fn test_list_buckets_shared_via_policy() {
             "Effect": "Allow",
             "Principal": {"AWS": "arn:loch:iam:::user/bob"},
             "Action": ["s3:ListBucket", "s3:GetObject"],
-            "Resource": ["arn:aws:s3:::shared-list", "arn:aws:s3:::shared-list/*"]
+            "Resource": ["arn:loch:s3:::shared-list", "arn:loch:s3:::shared-list/*"]
         }]
     }"#;
     let resp = sign_request(

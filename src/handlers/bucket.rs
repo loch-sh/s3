@@ -79,7 +79,7 @@ pub async fn list_buckets(
                 continue;
             }
             // Include if s3:ListBucket is allowed via policy
-            let resource = format!("arn:aws:s3:::{}", b.name);
+            let resource = format!("arn:loch:s3:::{}", b.name);
             let allowed = match storage.get_bucket_policy(&b.name).await {
                 Ok(data) => match serde_json::from_slice::<crate::policy::BucketPolicy>(&data) {
                     Ok(policy) => {

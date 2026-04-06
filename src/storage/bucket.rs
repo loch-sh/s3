@@ -11,6 +11,7 @@ use crate::error::S3Error;
 pub struct BucketInfo {
     pub name: String,
     pub creation_date: SystemTime,
+    pub owner: Option<String>,
 }
 
 /// Persisted bucket metadata stored in .metadata.
@@ -110,7 +111,7 @@ impl Storage {
         }
     }
 
-    /// List all buckets.
+    /// List all buckets with their owner. Filtering by access is done at the handler level.
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>, S3Error> {
         let mut buckets = Vec::new();
         let mut entries = fs::read_dir(&self.data_dir)
@@ -130,10 +131,13 @@ impl Storage {
 
             // Only include real directories (not symlinks)
             if meta.is_dir() && !meta.file_type().is_symlink() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let owner = self.get_bucket_owner(&name).await.unwrap_or(None);
                 let creation_date = read_bucket_creation_date(&entry.path()).await;
                 buckets.push(BucketInfo {
-                    name: entry.file_name().to_string_lossy().to_string(),
+                    name,
                     creation_date,
+                    owner,
                 });
             }
         }

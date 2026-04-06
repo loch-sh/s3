@@ -61,6 +61,11 @@ enum UsersCmd {
     },
     /// Delete a user
     Delete { user_id: String },
+    /// Create a user with auto-generated credentials
+    Create {
+        /// Display name (also used to derive the user_id)
+        name: String,
+    },
 }
 
 fn users_url(server: &str, user_id: Option<&str>) -> Url {
@@ -163,6 +168,78 @@ fn cmd_users_put(
     }
 }
 
+fn slugify(name: &str) -> String {
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    // Deduplicate consecutive hyphens and trim leading/trailing hyphens
+    let mut result = String::new();
+    let mut prev_hyphen = true; // treat start as hyphen to trim leading
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                result.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+    // Trim trailing hyphen
+    while result.ends_with('-') {
+        result.pop();
+    }
+    result.truncate(128);
+    result
+}
+
+fn generate_key(len: usize) -> String {
+    use rand::RngExt;
+    use rand::distr::Alphanumeric;
+    rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
+fn cmd_users_create(client: &Client, server: &str, api_key: &str, name: &str) {
+    let user_id = slugify(name);
+    if user_id.is_empty() {
+        eprintln!("Error: name '{}' produces an empty user_id", name);
+        std::process::exit(1);
+    }
+    let access_key = generate_key(20);
+    let secret_key = generate_key(40);
+
+    let url = users_url(server, Some(&user_id));
+    let body = serde_json::json!({
+        "display_name": name,
+        "access_key_id": access_key,
+        "secret_access_key": secret_key,
+    });
+    let resp = send_or_exit(
+        client
+            .put(url)
+            .header(AUTHORIZATION, bearer(api_key))
+            .json(&body),
+    );
+
+    let status = resp.status();
+    if !status.is_success() {
+        print_error_and_exit(resp);
+    }
+    if status == reqwest::StatusCode::OK {
+        eprintln!("Warning: user '{}' already existed — credentials have been replaced", user_id);
+    }
+    println!("User:       {}", user_id);
+    println!("Access Key: {}", access_key);
+    println!("Secret Key: {}", secret_key);
+}
+
 fn cmd_users_delete(client: &Client, server: &str, api_key: &str, user_id: &str) {
     let url = users_url(server, Some(user_id));
     let resp = send_or_exit(client.delete(url).header(AUTHORIZATION, bearer(api_key)));
@@ -205,6 +282,7 @@ fn main() {
             UsersCmd::Delete { user_id } => {
                 cmd_users_delete(&client, &cli.server, &api_key, &user_id)
             }
+            UsersCmd::Create { name } => cmd_users_create(&client, &cli.server, &api_key, &name),
         },
     }
 }

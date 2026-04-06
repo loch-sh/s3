@@ -96,6 +96,7 @@ pub async fn route(
         Ok(Some(user)) => Some(user.user_id.clone()),
         _ => None,
     };
+    let caller_is_root: bool = matches!(&auth_result, Ok(Some(user)) if user.is_root);
     if let Some(deny) = check_auth(
         &auth_result,
         &config,
@@ -279,7 +280,14 @@ pub async fn route(
     // Standard S3 operations
     let response = match (&method, has_bucket, has_key) {
         // GET / — ListBuckets
-        (&Method::GET, false, false) => handlers::bucket::list_buckets(storage.clone()).await,
+        (&Method::GET, false, false) => {
+            handlers::bucket::list_buckets(
+                storage.clone(),
+                caller_user_id.as_deref(),
+                caller_is_root,
+            )
+            .await
+        }
 
         // PUT /{bucket} — CreateBucket
         (&Method::PUT, true, false) => {

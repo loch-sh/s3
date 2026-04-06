@@ -4809,3 +4809,171 @@ async fn test_cli_users_env_vars() {
 
     cleanup(&tmp_dir);
 }
+
+// ======== ListBuckets visibility tests ========
+
+/// Helper: parse bucket names from a ListAllMyBucketsResult XML response.
+fn parse_bucket_names(xml: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Name>") {
+        rest = &rest[start + "<Name>".len()..];
+        if let Some(end) = rest.find("</Name>") {
+            names.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+    }
+    names
+}
+
+#[tokio::test]
+async fn test_list_buckets_owner_only() {
+    // A non-root user without any policy grants only sees their own buckets.
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Alice creates her bucket
+    sign_request(
+        client.put(format!("{}/alice-only", base_url)),
+        "PUT", "/alice-only", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Root creates a bucket (not shared)
+    sign_request(
+        client.put(format!("{}/root-private", base_url)),
+        "PUT", "/root-private", "", host, b"",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Alice's ListBuckets should contain only her bucket
+    let resp = sign_request(
+        client.get(&base_url),
+        "GET", "/", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let buckets = parse_bucket_names(&resp.text().await.unwrap());
+    assert!(buckets.contains(&"alice-only".to_string()), "Alice should see her own bucket");
+    assert!(!buckets.contains(&"root-private".to_string()), "Alice should not see root's bucket");
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_list_buckets_shared_via_policy() {
+    // A bucket shared with s3:ListBucket appears in the grantee's ListBuckets.
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Alice creates a bucket and uploads an object
+    sign_request(
+        client.put(format!("{}/shared-list", base_url)),
+        "PUT", "/shared-list", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    sign_request(
+        client.put(format!("{}/shared-list/hello.txt", base_url)).body("hello"),
+        "PUT", "/shared-list/hello.txt", "", host, b"hello",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Bob cannot see the bucket before policy is set
+    let resp = sign_request(
+        client.get(&base_url),
+        "GET", "/", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    let buckets = parse_bucket_names(&resp.text().await.unwrap());
+    assert!(!buckets.contains(&"shared-list".to_string()), "Bob should not see the bucket before policy");
+
+    // Alice grants Bob s3:ListBucket + s3:GetObject
+    let policy_json = r#"{
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:loch:iam:::user/bob"},
+            "Action": ["s3:ListBucket", "s3:GetObject"],
+            "Resource": ["arn:aws:s3:::shared-list", "arn:aws:s3:::shared-list/*"]
+        }]
+    }"#;
+    let resp = sign_request(
+        client.put(format!("{}/shared-list?policy", base_url)).body(policy_json),
+        "PUT", "/shared-list", "policy", host, policy_json.as_bytes(),
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 204, "PUT policy should succeed");
+
+    // Bob now sees the shared bucket in ListBuckets
+    let resp = sign_request(
+        client.get(&base_url),
+        "GET", "/", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let buckets = parse_bucket_names(&resp.text().await.unwrap());
+    assert!(buckets.contains(&"shared-list".to_string()), "Bob should see the shared bucket after policy");
+
+    // Bob can list objects in the shared bucket
+    let resp = sign_request(
+        client.get(format!("{}/shared-list", base_url)),
+        "GET", "/shared-list", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "Bob should be able to list objects");
+    assert!(resp.text().await.unwrap().contains("hello.txt"));
+
+    // Bob can read objects in the shared bucket
+    let resp = sign_request(
+        client.get(format!("{}/shared-list/hello.txt", base_url)),
+        "GET", "/shared-list/hello.txt", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello");
+
+    // Bob cannot write (only read was granted)
+    let resp = sign_request(
+        client.put(format!("{}/shared-list/intruder.txt", base_url)).body("nope"),
+        "PUT", "/shared-list/intruder.txt", "", host, b"nope",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 403, "Bob should not be able to write");
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_list_buckets_root_sees_all() {
+    // Root always sees all buckets regardless of owner.
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    sign_request(
+        client.put(format!("{}/alice-bucket2", base_url)),
+        "PUT", "/alice-bucket2", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    sign_request(
+        client.put(format!("{}/bob-bucket2", base_url)),
+        "PUT", "/bob-bucket2", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+
+    let resp = sign_request(
+        client.get(&base_url),
+        "GET", "/", "", host, b"",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let buckets = parse_bucket_names(&resp.text().await.unwrap());
+    assert!(buckets.contains(&"alice-bucket2".to_string()), "Root should see Alice's bucket");
+    assert!(buckets.contains(&"bob-bucket2".to_string()), "Root should see Bob's bucket");
+
+    cleanup(&tmp_dir);
+}

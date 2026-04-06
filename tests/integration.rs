@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -10,6 +11,7 @@ use s3::ServerConfig;
 use s3::auth::Credentials;
 use s3::encryption::EncryptionConfig;
 use s3::storage::Storage;
+use s3::users::{UserRecord, UserStore};
 
 const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -21,12 +23,14 @@ async fn start_server() -> (String, std::path::PathBuf) {
 
 /// Start a test server with optional authentication on a random port.
 async fn start_server_with_auth(credentials: Option<Credentials>) -> (String, std::path::PathBuf) {
-    start_server_full(credentials, None).await
+    let user_store = credentials.map(|c| Arc::new(RwLock::new(UserStore::from_single_credentials(c))));
+    start_server_full(user_store, None, None).await
 }
 
 /// Start a test server with optional auth and optional encryption on a random port.
 async fn start_server_full(
-    credentials: Option<Credentials>,
+    user_store: Option<Arc<RwLock<UserStore>>>,
+    admin_api_key: Option<String>,
     encryption: Option<EncryptionConfig>,
 ) -> (String, std::path::PathBuf) {
     let tmp_dir = std::env::temp_dir().join(format!("s3-test-{}", uuid::Uuid::new_v4()));
@@ -37,7 +41,8 @@ async fn start_server_full(
 
     let config = Arc::new(ServerConfig {
         storage: Arc::new(Storage::new(tmp_dir.clone())),
-        credentials,
+        user_store,
+        admin_api_key,
         upload_ttl_secs: 86400,
         encryption,
     });
@@ -55,7 +60,7 @@ async fn start_server_full(
 /// Start a test server with SSE-S3 encryption enabled.
 async fn start_server_with_encryption() -> (String, std::path::PathBuf, [u8; 32]) {
     let master_key = [0x42u8; 32]; // deterministic test key
-    let (url, tmp) = start_server_full(None, Some(EncryptionConfig { master_key })).await;
+    let (url, tmp) = start_server_full(None, None, Some(EncryptionConfig { master_key })).await;
     (url, tmp, master_key)
 }
 
@@ -78,6 +83,50 @@ fn generate_customer_key_2() -> ([u8; 32], String, String) {
 /// Clean up test data directory.
 fn cleanup(tmp_dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(tmp_dir);
+}
+
+const ADMIN_API_KEY: &str = "test-admin-api-key-12345";
+const ALICE_ACCESS_KEY: &str = "AKIAALICEEXAMPLE";
+const ALICE_SECRET_KEY: &str = "AliceSecretKeyExample1234567890AB";
+const BOB_ACCESS_KEY: &str = "AKIABOBEXAMPLE00";
+const BOB_SECRET_KEY: &str = "BobSecretKeyExample12345678901234";
+
+/// Start a multi-user test server with root + alice + bob.
+async fn start_multi_user_server() -> (String, std::path::PathBuf) {
+    let tmp_dir = std::env::temp_dir().join(format!("s3-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    // Write users file
+    let users_file = tmp_dir.join(".users.json");
+    let users_json = serde_json::json!({
+        "users": [
+            {
+                "user_id": "root",
+                "display_name": "Root Admin",
+                "access_key_id": TEST_ACCESS_KEY,
+                "secret_access_key": TEST_SECRET_KEY,
+                "is_root": true
+            },
+            {
+                "user_id": "alice",
+                "display_name": "Alice",
+                "access_key_id": ALICE_ACCESS_KEY,
+                "secret_access_key": ALICE_SECRET_KEY
+            },
+            {
+                "user_id": "bob",
+                "display_name": "Bob",
+                "access_key_id": BOB_ACCESS_KEY,
+                "secret_access_key": BOB_SECRET_KEY
+            }
+        ]
+    });
+    std::fs::write(&users_file, serde_json::to_string_pretty(&users_json).unwrap()).unwrap();
+
+    let store = UserStore::load_from_file(&users_file).unwrap();
+    let user_store = Some(Arc::new(RwLock::new(store)));
+
+    start_server_full(user_store, Some(ADMIN_API_KEY.to_string()), None).await
 }
 
 // ---- Helper: sign a request with AWS SigV4 ----
@@ -1229,7 +1278,7 @@ async fn test_presigned_url_no_anonymous_fallback() {
 
     let policy_json = r#"{
         "Version": "2012-10-17",
-        "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pub-presigned/*"}]
+        "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:loch:s3:::pub-presigned/*"}]
     }"#;
     let req = sign_request(
         client
@@ -1297,7 +1346,7 @@ async fn test_policy_crud() {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:GetObject",
-            "Resource": "arn:aws:s3:::policy-bucket/*"
+            "Resource": "arn:loch:s3:::policy-bucket/*"
         }]
     }"#;
     let req = sign_request(
@@ -1412,7 +1461,7 @@ async fn test_policy_public_read() {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:GetObject",
-            "Resource": "arn:aws:s3:::pub-bucket/*"
+            "Resource": "arn:loch:s3:::pub-bucket/*"
         }]
     }"#;
     let req = sign_request(
@@ -1491,7 +1540,7 @@ async fn test_policy_no_admin_access() {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:GetObject",
-            "Resource": "arn:aws:s3:::admin-bucket/*"
+            "Resource": "arn:loch:s3:::admin-bucket/*"
         }]
     }"#;
     let req = sign_request(
@@ -1576,7 +1625,7 @@ async fn test_policy_public_list() {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:ListBucket",
-            "Resource": "arn:aws:s3:::list-bucket"
+            "Resource": "arn:loch:s3:::list-bucket"
         }]
     }"#;
     let req = sign_request(
@@ -4314,6 +4363,617 @@ async fn test_sse_etag_is_plaintext_md5() {
         head_etag, expected_md5,
         "HEAD ETag should be MD5 of plaintext"
     );
+
+    cleanup(&tmp_dir);
+}
+
+// ==================== Multi-user tests ====================
+
+#[tokio::test]
+async fn test_multi_user_isolation() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Alice creates a bucket
+    let resp = sign_request(
+        client.put(format!("{}/alice-bucket", base_url)),
+        "PUT", "/alice-bucket", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Alice puts an object
+    let resp = sign_request(
+        client.put(format!("{}/alice-bucket/hello.txt", base_url)).body("hello from alice"),
+        "PUT", "/alice-bucket/hello.txt", "", host, b"hello from alice",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Alice can read her own object
+    let resp = sign_request(
+        client.get(format!("{}/alice-bucket/hello.txt", base_url)),
+        "GET", "/alice-bucket/hello.txt", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello from alice");
+
+    // Bob cannot read Alice's object (no policy)
+    let resp = sign_request(
+        client.get(format!("{}/alice-bucket/hello.txt", base_url)),
+        "GET", "/alice-bucket/hello.txt", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Bob cannot put into Alice's bucket
+    let resp = sign_request(
+        client.put(format!("{}/alice-bucket/bob.txt", base_url)).body("intruder"),
+        "PUT", "/alice-bucket/bob.txt", "", host, b"intruder",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_multi_user_policy_grant() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Alice creates a bucket and puts an object
+    sign_request(
+        client.put(format!("{}/shared-bucket", base_url)),
+        "PUT", "/shared-bucket", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    sign_request(
+        client.put(format!("{}/shared-bucket/file.txt", base_url)).body("shared data"),
+        "PUT", "/shared-bucket/file.txt", "", host, b"shared data",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Bob can't read yet
+    let resp = sign_request(
+        client.get(format!("{}/shared-bucket/file.txt", base_url)),
+        "GET", "/shared-bucket/file.txt", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Alice grants Bob GetObject via bucket policy
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:loch:iam:::user/bob"},
+            "Action": "s3:GetObject",
+            "Resource": "arn:loch:s3:::shared-bucket/*"
+        }]
+    });
+    let policy_bytes = serde_json::to_vec(&policy).unwrap();
+    sign_request(
+        client.put(format!("{}/shared-bucket?policy", base_url)).body(policy_bytes.clone()),
+        "PUT", "/shared-bucket", "policy", host, &policy_bytes,
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Now Bob can read
+    let resp = sign_request(
+        client.get(format!("{}/shared-bucket/file.txt", base_url)),
+        "GET", "/shared-bucket/file.txt", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "shared data");
+
+    // Bob still can't write (only GetObject granted)
+    let resp = sign_request(
+        client.put(format!("{}/shared-bucket/bob.txt", base_url)).body("nope"),
+        "PUT", "/shared-bucket/bob.txt", "", host, b"nope",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_root_access_all() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Alice creates a bucket and puts an object
+    sign_request(
+        client.put(format!("{}/alice-priv", base_url)),
+        "PUT", "/alice-priv", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    sign_request(
+        client.put(format!("{}/alice-priv/secret.txt", base_url)).body("secret"),
+        "PUT", "/alice-priv/secret.txt", "", host, b"secret",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Root can read Alice's object
+    let resp = sign_request(
+        client.get(format!("{}/alice-priv/secret.txt", base_url)),
+        "GET", "/alice-priv/secret.txt", "", host, b"",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "secret");
+
+    // Root can delete Alice's bucket
+    sign_request(
+        client.delete(format!("{}/alice-priv/secret.txt", base_url)),
+        "DELETE", "/alice-priv/secret.txt", "", host, b"",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+
+    let resp = sign_request(
+        client.delete(format!("{}/alice-priv", base_url)),
+        "DELETE", "/alice-priv", "", host, b"",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_user_api_crud() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+
+    // List users
+    let resp = client.get(format!("{}/_loch/users", base_url))
+        .header("Authorization", format!("Bearer {}", ADMIN_API_KEY))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let users = body["users"].as_array().unwrap();
+    assert_eq!(users.len(), 3);
+    // secret_access_key should NOT be in the response
+    assert!(users[0].get("secret_access_key").is_none());
+
+    // Get specific user
+    let resp = client.get(format!("{}/_loch/users/alice", base_url))
+        .header("Authorization", format!("Bearer {}", ADMIN_API_KEY))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["user_id"], "alice");
+    assert_eq!(body["display_name"], "Alice");
+    assert!(body.get("secret_access_key").is_none());
+
+    // Create a new user
+    let new_user = serde_json::json!({
+        "display_name": "Charlie",
+        "access_key_id": "AKIACHARLIE00000",
+        "secret_access_key": "CharlieSecretKey123456789012345"
+    });
+    let resp = client.put(format!("{}/_loch/users/charlie", base_url))
+        .header("Authorization", format!("Bearer {}", ADMIN_API_KEY))
+        .json(&new_user)
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // Verify Charlie exists
+    let resp = client.get(format!("{}/_loch/users", base_url))
+        .header("Authorization", format!("Bearer {}", ADMIN_API_KEY))
+        .send().await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["users"].as_array().unwrap().len(), 4);
+
+    // Delete Charlie
+    let resp = client.delete(format!("{}/_loch/users/charlie", base_url))
+        .header("Authorization", format!("Bearer {}", ADMIN_API_KEY))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Cannot delete root
+    let resp = client.delete(format!("{}/_loch/users/root", base_url))
+        .header("Authorization", format!("Bearer {}", ADMIN_API_KEY))
+        .send().await.unwrap();
+    assert!(resp.status().is_client_error());
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_user_api_requires_admin_key() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+
+    // No auth header
+    let resp = client.get(format!("{}/_loch/users", base_url))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Wrong key
+    let resp = client.get(format!("{}/_loch/users", base_url))
+        .header("Authorization", "Bearer wrong-key")
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_anonymous_denied_when_users_configured() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Root creates a bucket and puts an object
+    sign_request(
+        client.put(format!("{}/private-bucket", base_url)),
+        "PUT", "/private-bucket", "", host, b"",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+
+    sign_request(
+        client.put(format!("{}/private-bucket/data.txt", base_url)).body("private"),
+        "PUT", "/private-bucket/data.txt", "", host, b"private",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Anonymous GET should be denied (no public policy)
+    let resp = client.get(format!("{}/private-bucket/data.txt", base_url))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    cleanup(&tmp_dir);
+}
+
+// --- CLI tests ---
+
+fn loch_s3_bin() -> std::path::PathBuf {
+    std::env::var("CARGO_BIN_EXE_loch-s3")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let mut p = std::env::current_exe().expect("cannot determine test binary path");
+            p.pop();
+            if p.ends_with("deps") {
+                p.pop();
+            }
+            // Unix only: no .exe suffix needed
+            p.push("loch-s3");
+            p
+        })
+}
+
+#[tokio::test]
+async fn test_cli_users_list() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "list"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+
+    assert!(
+        output.status.success(),
+        "exit code: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+    let users = parsed["users"].as_array().expect("response must have a 'users' array");
+    assert!(!users.is_empty(), "expected at least one user");
+    for u in users {
+        assert!(u.get("secret_access_key").is_none(), "secret key leaked");
+    }
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cli_users_get() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "get", "alice"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("stdout is valid JSON");
+    assert_eq!(parsed["user_id"], "alice");
+    assert_eq!(parsed["display_name"], "Alice");
+    assert!(parsed.get("secret_access_key").is_none());
+
+    // Non-existent user must exit with code 1
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "get", "nobody"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    assert!(!output.status.success());
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cli_users_put_and_delete() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    // Create user
+    let output = tokio::process::Command::new(&bin)
+        .args([
+            "--server", &base_url,
+            "--api-key", ADMIN_API_KEY,
+            "users", "put", "dave",
+            "--display-name", "Dave",
+            "--access-key", "AKIADAVE00000001",
+            "--secret-key", "DaveSecretKey123456789012345678",
+        ])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify it appears in list
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "list"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("stdout is valid JSON");
+    let ids: Vec<&str> = parsed["users"]
+        .as_array()
+        .expect("response must have a 'users' array")
+        .iter()
+        .map(|u| u["user_id"].as_str().expect("user_id is a string"))
+        .collect();
+    assert!(ids.contains(&"dave"));
+
+    // Delete user
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "delete", "dave"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    assert!(output.status.success());
+
+    // Verify deleted
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", ADMIN_API_KEY, "users", "get", "dave"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+    assert!(!output.status.success());
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cli_users_wrong_api_key() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    let output = tokio::process::Command::new(&bin)
+        .args(["--server", &base_url, "--api-key", "wrong-key", "users", "list"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("403"), "expected 403 in stderr, got: {}", stderr);
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cli_users_env_vars() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let bin = loch_s3_bin();
+
+    let output = tokio::process::Command::new(&bin)
+        .env("LOCH_SERVER", &base_url)
+        .env("LOCH_ADMIN_KEY", ADMIN_API_KEY)
+        .args(["users", "list"])
+        .output()
+        .await
+        .expect("failed to run loch-s3");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("stdout is valid JSON");
+    assert!(
+        !parsed["users"].as_array().expect("response must have a 'users' array").is_empty(),
+        "expected at least one user"
+    );
+
+    cleanup(&tmp_dir);
+}
+
+// ======== ListBuckets visibility tests ========
+
+/// Helper: parse bucket names from a ListAllMyBucketsResult XML response.
+fn parse_bucket_names(xml: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Name>") {
+        rest = &rest[start + "<Name>".len()..];
+        if let Some(end) = rest.find("</Name>") {
+            names.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+    }
+    names
+}
+
+#[tokio::test]
+async fn test_list_buckets_owner_only() {
+    // A non-root user without any policy grants only sees their own buckets.
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Alice creates her bucket
+    sign_request(
+        client.put(format!("{}/alice-only", base_url)),
+        "PUT", "/alice-only", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Root creates a bucket (not shared)
+    sign_request(
+        client.put(format!("{}/root-private", base_url)),
+        "PUT", "/root-private", "", host, b"",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Alice's ListBuckets should contain only her bucket
+    let resp = sign_request(
+        client.get(&base_url),
+        "GET", "/", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let buckets = parse_bucket_names(&resp.text().await.unwrap());
+    assert!(buckets.contains(&"alice-only".to_string()), "Alice should see her own bucket");
+    assert!(!buckets.contains(&"root-private".to_string()), "Alice should not see root's bucket");
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_list_buckets_shared_via_policy() {
+    // A bucket shared with s3:ListBucket appears in the grantee's ListBuckets.
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    // Alice creates a bucket and uploads an object
+    sign_request(
+        client.put(format!("{}/shared-list", base_url)),
+        "PUT", "/shared-list", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    sign_request(
+        client.put(format!("{}/shared-list/hello.txt", base_url)).body("hello"),
+        "PUT", "/shared-list/hello.txt", "", host, b"hello",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    // Bob cannot see the bucket before policy is set
+    let resp = sign_request(
+        client.get(&base_url),
+        "GET", "/", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    let buckets = parse_bucket_names(&resp.text().await.unwrap());
+    assert!(!buckets.contains(&"shared-list".to_string()), "Bob should not see the bucket before policy");
+
+    // Alice grants Bob s3:ListBucket + s3:GetObject
+    let policy_json = r#"{
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:loch:iam:::user/bob"},
+            "Action": ["s3:ListBucket", "s3:GetObject"],
+            "Resource": ["arn:loch:s3:::shared-list", "arn:loch:s3:::shared-list/*"]
+        }]
+    }"#;
+    let resp = sign_request(
+        client.put(format!("{}/shared-list?policy", base_url)).body(policy_json),
+        "PUT", "/shared-list", "policy", host, policy_json.as_bytes(),
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 204, "PUT policy should succeed");
+
+    // Bob now sees the shared bucket in ListBuckets
+    let resp = sign_request(
+        client.get(&base_url),
+        "GET", "/", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let buckets = parse_bucket_names(&resp.text().await.unwrap());
+    assert!(buckets.contains(&"shared-list".to_string()), "Bob should see the shared bucket after policy");
+
+    // Bob can list objects in the shared bucket
+    let resp = sign_request(
+        client.get(format!("{}/shared-list", base_url)),
+        "GET", "/shared-list", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "Bob should be able to list objects");
+    assert!(resp.text().await.unwrap().contains("hello.txt"));
+
+    // Bob can read objects in the shared bucket
+    let resp = sign_request(
+        client.get(format!("{}/shared-list/hello.txt", base_url)),
+        "GET", "/shared-list/hello.txt", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello");
+
+    // Bob cannot write (only read was granted)
+    let resp = sign_request(
+        client.put(format!("{}/shared-list/intruder.txt", base_url)).body("nope"),
+        "PUT", "/shared-list/intruder.txt", "", host, b"nope",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 403, "Bob should not be able to write");
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_list_buckets_root_sees_all() {
+    // Root always sees all buckets regardless of owner.
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.strip_prefix("http://").unwrap();
+
+    sign_request(
+        client.put(format!("{}/alice-bucket2", base_url)),
+        "PUT", "/alice-bucket2", "", host, b"",
+        ALICE_ACCESS_KEY, ALICE_SECRET_KEY,
+    ).send().await.unwrap();
+
+    sign_request(
+        client.put(format!("{}/bob-bucket2", base_url)),
+        "PUT", "/bob-bucket2", "", host, b"",
+        BOB_ACCESS_KEY, BOB_SECRET_KEY,
+    ).send().await.unwrap();
+
+    let resp = sign_request(
+        client.get(&base_url),
+        "GET", "/", "", host, b"",
+        TEST_ACCESS_KEY, TEST_SECRET_KEY,
+    ).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let buckets = parse_bucket_names(&resp.text().await.unwrap());
+    assert!(buckets.contains(&"alice-bucket2".to_string()), "Root should see Alice's bucket");
+    assert!(buckets.contains(&"bob-bucket2".to_string()), "Root should see Bob's bucket");
 
     cleanup(&tmp_dir);
 }

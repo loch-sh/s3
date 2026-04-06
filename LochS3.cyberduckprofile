@@ -29,7 +29,7 @@
             <key>s3.storage.class</key>
             <string>STANDARD</string>
             <key>s3service.default-storage-class</key>
-            <string>STANDARD</key>
+            <string>STANDARD</string>
         </dict>
     </dict>
 </plist>

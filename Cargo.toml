@@ -2,9 +2,10 @@
 name = "s3"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "macros", "signal", "process"] }
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
@@ -24,6 +25,13 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 base64 = "0.22"
 rand = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.13", features = ["blocking", "json"] }
 
-[dev-dependencies]
-reqwest = { version = "0.13", features = ["blocking"] }
+[[bin]]
+name = "s3"
+path = "src/main.rs"
+
+[[bin]]
+name = "loch-s3"
+path = "src/bin/loch-s3.rs"

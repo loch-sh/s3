@@ -18,8 +18,9 @@ It is designed primarily for server-to-server use, as it is better in our opinio
 - **AWS CLI compatible**: Works with `aws s3`, `aws s3api`, and S3 SDKs via `--endpoint-url`
 - **Server-side encryption**: SSE-S3 (server-managed key) and SSE-C (customer-provided key) with AES-256-GCM
 - **Presigned URLs**: Time-limited signed URLs for temporary object access without credentials
-- **Authentication**: Optional AWS Signature V4 authentication
-- **Bucket policies**: Per-bucket public access control (anonymous read, etc.)
+- **Multi-user authentication**: Multiple users with individual credentials, bucket/object ownership, and per-user bucket policies using ARN-based principals (`arn:loch:iam:::user/{user_id}`)
+- **User management API**: REST API (`/_loch/users`) for creating, listing, and deleting users, protected by a dedicated admin API key
+- **Bucket policies**: Per-bucket access control for anonymous and per-user access
 - **Access control lists (ACLs)**: Bucket and object ACLs with canned ACL support (`private`, `public-read`, `public-read-write`)
 - **Bucket default encryption**: Configure a default SSE-S3 encryption policy per bucket
 - **CORS**: Cross-Origin Resource Sharing support for browser-based access
@@ -27,7 +28,7 @@ It is designed primarily for server-to-server use, as it is better in our opinio
 - **Concurrent**: Handles multiple requests in parallel with atomic writes
 - **Docker ready**: Multi-stage Alpine-based image (~15 MB)
 
-## Supported Endpoints
+## S3 Endpoints
 
 | Operation                | Method    | Path                                           |
 | ------------------------ | --------- | ---------------------------------------------- |
@@ -70,6 +71,64 @@ It is designed primarily for server-to-server use, as it is better in our opinio
 | GetObject (presigned)    | `GET`     | `/{bucket}/{key}?X-Amz-Algorithm=...`          |
 | PutObject (presigned)    | `PUT`     | `/{bucket}/{key}?X-Amz-Algorithm=...`          |
 
+These endpoints use AWS Signature V4 authentication (when configured). They are compatible with the AWS CLI and S3 SDKs.
+
+## Admin Endpoints
+
+User management API, protected by `S3_ADMIN_API_KEY` (Bearer token). Only available in multi-user mode (`S3_USERS_FILE`).
+
+| Operation          | Method   | Path                     | Description                                          |
+| ------------------ | -------- | ------------------------ | ---------------------------------------------------- |
+| ListUsers          | `GET`    | `/_loch/users`           | List all users (secret keys are never returned)      |
+| GetUser            | `GET`    | `/_loch/users/{user_id}` | Get a specific user                                  |
+| CreateOrUpdateUser | `PUT`    | `/_loch/users/{user_id}` | Create or update a user (root cannot be modified)    |
+| DeleteUser         | `DELETE` | `/_loch/users/{user_id}` | Delete a user (root cannot be deleted)               |
+
+## CLI: `loch-s3`
+
+`loch-s3` is a command-line tool for managing users via the admin API. It is distributed alongside the `s3` server binary (releases, Docker image).
+
+### Configuration
+
+| Flag / Env var              | Default                 | Description                  |
+| --------------------------- | ----------------------- | ---------------------------- |
+| `--server` / `LOCH_SERVER`  | `http://localhost:8080` | Server URL                   |
+| `--api-key` / `LOCH_ADMIN_KEY` | _(required)_         | Admin API key (Bearer token) |
+
+Flags take precedence over environment variables.
+
+### Commands
+
+```bash
+# List all users
+loch-s3 users list
+
+# Get a specific user
+loch-s3 users get <user_id>
+
+# Create or update a user
+loch-s3 users put <user_id> \
+  --display-name "Alice" \
+  --access-key AKIAALICE00000000 \
+  --secret-key "AliceSecretKey..."
+
+# Delete a user
+loch-s3 users delete <user_id>
+```
+
+All commands output pretty-printed JSON on stdout. Errors print the HTTP error body to stderr and exit with code 1.
+
+### With Docker
+
+Both `s3` and `loch-s3` are included in the Docker image:
+
+```bash
+docker exec <container> loch-s3 \
+  --server http://localhost:8080 \
+  --api-key "$S3_ADMIN_API_KEY" \
+  users list
+```
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) 1.85+ (for building from source)
@@ -91,10 +150,16 @@ make release
 make docker
 docker run -p 9000:8080 -v s3-data:/data ghcr.io/loch-sh/s3
 
-# With authentication:
+# With single-user authentication:
 docker run -p 9000:8080 -v s3-data:/data \
   -e S3_ACCESS_KEY_ID=myaccesskey \
   -e S3_SECRET_ACCESS_KEY=mysecretkey \
+  ghcr.io/loch-sh/s3
+
+# With multi-user authentication (auto-bootstraps on first run):
+docker run -p 9000:8080 -v s3-data:/data \
+  -e S3_USERS_FILE=/data/.users.json \
+  -e S3_ADMIN_API_KEY=my-admin-key \
   ghcr.io/loch-sh/s3
 
 # With authentication + SSE-S3 encryption:
@@ -141,12 +206,18 @@ Configuration is done via environment variables:
 | ---------------------- | -------- | -------------------------------------------- |
 | `S3_PORT`              | `8080`   | Port the server listens on                   |
 | `S3_DATA_DIR`          | `./data` | Directory for storing objects                |
-| `S3_ACCESS_KEY_ID`     | _(none)_ | Access key for authentication (optional)     |
-| `S3_SECRET_ACCESS_KEY` | _(none)_ | Secret key for authentication (optional)     |
+| `S3_USERS_FILE`        | _(none)_ | Path to users JSON file (enables multi-user) |
+| `S3_ACCESS_KEY_ID`     | _(none)_ | Access key for single-user mode (ignored if `S3_USERS_FILE` is set) |
+| `S3_SECRET_ACCESS_KEY` | _(none)_ | Secret key for single-user mode (ignored if `S3_USERS_FILE` is set) |
+| `S3_ADMIN_API_KEY`     | _(none)_ | Bearer token for the user management API `/_loch/users` |
 | `S3_UPLOAD_TTL`        | `86400`  | Multipart upload expiry in seconds (24h)     |
 | `S3_ENCRYPTION_KEY`    | _(none)_ | Base64-encoded 32-byte master key for SSE-S3 |
 
-When both `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` are set, the server requires AWS Signature V4 authentication on all requests. When unset, all requests are allowed without authentication.
+**Authentication modes** (in priority order):
+
+1. **Multi-user** (`S3_USERS_FILE`): Multiple users with individual access keys, bucket ownership, and per-user policies. Each user is identified by an ARN (`arn:loch:iam:::user/{user_id}`). The root user has full access, bucket owners have full access on their buckets, and other users need explicit bucket policy grants. Buckets are private by default.
+2. **Single-user** (`S3_ACCESS_KEY_ID` + `S3_SECRET_ACCESS_KEY`): Backward-compatible mode with a single root credential pair. The user management API is disabled.
+3. **Open access** (no credentials configured): All requests are allowed without authentication.
 
 When `S3_ENCRYPTION_KEY` is set, the server supports SSE-S3 encryption (`x-amz-server-side-encryption: AES256`). SSE-C (customer-provided keys) works regardless of this setting. See [SECURITY.md](SECURITY.md) for details.
 
@@ -156,10 +227,40 @@ Example without authentication:
 S3_PORT=9000 S3_DATA_DIR=/tmp/s3-data ./target/release/s3
 ```
 
-Example with authentication:
+Example with single-user authentication:
 
 ```bash
 S3_ACCESS_KEY_ID=myaccesskey S3_SECRET_ACCESS_KEY=mysecretkey ./target/release/s3
+```
+
+Example with multi-user authentication:
+
+```bash
+# First run: the users file is created automatically with a generated root user.
+# Credentials are printed to stderr — save them!
+S3_USERS_FILE=users.json S3_ADMIN_API_KEY=my-admin-key ./target/release/s3
+
+# =============================================================
+#   Users file not found — bootstrapping with a new root user
+#   File:             users.json
+#   Access Key ID:    EIWcQK7Dp5dub4Fy9B2m
+#   Secret Access Key: yo9WlSEVTDZU0AbxVpiOFXJpR0v2XToocejkgPrk
+#   SAVE THESE CREDENTIALS — they will not be shown again.
+# =============================================================
+
+# Subsequent runs load the existing users file.
+# Add more users via the API (see User management API below).
+```
+
+You can also create the users file manually:
+
+```json
+{
+  "users": [
+    {"user_id": "admin", "display_name": "Admin", "access_key_id": "AKIAADMIN", "secret_access_key": "admin-secret-key-here", "is_root": true},
+    {"user_id": "alice", "display_name": "Alice", "access_key_id": "AKIAALICE", "secret_access_key": "alice-secret-key-here"}
+  ]
+}
 ```
 
 ## Usage with AWS CLI
@@ -235,6 +336,29 @@ aws --endpoint-url http://localhost:8080 s3 cp s3://my-bucket/myfile.txt s3://my
 aws --endpoint-url http://localhost:8080 s3 rm s3://my-bucket/myfile.txt
 ```
 
+### User management API
+
+When using multi-user mode with `S3_ADMIN_API_KEY` configured, you can manage users via the REST API:
+
+```bash
+# List all users
+curl -H "Authorization: Bearer my-admin-key" http://localhost:8080/_loch/users
+
+# Get a specific user
+curl -H "Authorization: Bearer my-admin-key" http://localhost:8080/_loch/users/alice
+
+# Create a new user
+curl -X PUT -H "Authorization: Bearer my-admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{"display_name": "Bob", "access_key_id": "AKIABOB", "secret_access_key": "bob-secret"}' \
+  http://localhost:8080/_loch/users/bob
+
+# Delete a user
+curl -X DELETE -H "Authorization: Bearer my-admin-key" http://localhost:8080/_loch/users/bob
+```
+
+The `secret_access_key` is write-only — it is never returned in GET responses. Changes take effect immediately (no restart required). The root user cannot be deleted.
+
 ### Bucket policy (public read)
 
 When authentication is enabled, you can allow anonymous read access to a bucket via a bucket policy:
@@ -258,6 +382,28 @@ curl http://localhost:8080/my-bucket/myfile.txt
 ```
 
 Supported actions: `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`, `s3:GetBucketLocation`, `s3:*`.
+
+#### Per-user bucket policy
+
+In multi-user mode, you can grant access to specific users by referencing their ARN:
+
+```bash
+# Grant alice read access to a bucket owned by another user
+aws --endpoint-url http://localhost:8080 s3api put-bucket-policy \
+  --bucket my-bucket \
+  --policy '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:loch:iam:::user/alice"},
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"]
+    }]
+  }'
+
+# Grant multiple users
+# "Principal": {"AWS": ["arn:loch:iam:::user/alice", "arn:loch:iam:::user/bob"]}
+```
 
 ### Multipart upload
 
@@ -541,13 +687,14 @@ The integration test suite covers:
 - Object metadata: roundtrip persistence (PUT/GET/HEAD), Content-Type override, backward compatibility, copy with COPY/REPLACE directive, metadata cleanup on delete
 - Server-side encryption: SSE-S3 PUT/GET/HEAD, SSE-C PUT/GET/HEAD, SSE-S3/SSE-C multipart upload, copy between encryption modes, error cases (missing key, wrong key, invalid algorithm, no master key configured), ETag integrity, large object multi-chunk encryption
 - Presigned URLs: valid presigned GET, expired URL rejection (`ExpiredToken`), wrong secret rejection, no fallback to anonymous access on invalid signature
+- Multi-user: bucket isolation between users, per-user policy grants, root access to all buckets, user management API CRUD, admin API key enforcement, anonymous denial when auth is configured
 
 ## Known Limitations
 
-- Single credential pair only (no multi-user support, except anonymous one and main user)
 - Path-style URLs only (no virtual-hosted-style)
 - No SSE-KMS (only SSE-S3 and SSE-C are supported)
+- No IAM policies (only resource-based bucket policies)
 
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](LICENSE).

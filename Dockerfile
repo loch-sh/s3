@@ -10,6 +10,7 @@ RUN cargo build --release
 FROM alpine:latest
 RUN addgroup -S s3 && adduser -S s3 -G s3
 COPY --from=builder /app/target/release/s3 /usr/local/bin/s3
+COPY --from=builder /app/target/release/loch-s3 /usr/local/bin/loch-s3
 RUN mkdir -p /data && chown s3:s3 /data
 USER s3
 EXPOSE 8080

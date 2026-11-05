@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{Storage, is_real_dir, is_regular_file};
 use crate::error::S3Error;
+use crate::quota::{Reservation, file_size};
 use crate::storage::bucket::format_system_time;
 use crate::storage::object::compute_file_md5;
 
@@ -41,6 +42,14 @@ pub struct UploadInfo {
 const UPLOADS_DIR: &str = ".uploads";
 const META_FILE: &str = ".meta.json";
 
+/// An upload ID is valid only in the canonical hyphenated lowercase UUID form.
+pub(crate) fn is_valid_upload_id(upload_id: &str) -> bool {
+    match uuid::Uuid::parse_str(upload_id) {
+        Ok(u) => u.hyphenated().to_string() == upload_id,
+        Err(_) => false,
+    }
+}
+
 impl Storage {
     /// Path to the .uploads directory within a bucket.
     fn uploads_dir(&self, bucket: &str) -> PathBuf {
@@ -48,14 +57,28 @@ impl Storage {
     }
 
     /// Path to a specific upload directory.
-    fn upload_path(&self, bucket: &str, upload_id: &str) -> PathBuf {
-        self.uploads_dir(bucket).join(upload_id)
+    /// The upload ID must be a canonical UUID (the only format this server generates):
+    /// anything else is rejected with `NoSuchUpload` before being joined to a path.
+    fn upload_path(&self, bucket: &str, upload_id: &str) -> Result<PathBuf, S3Error> {
+        if !is_valid_upload_id(upload_id) {
+            return Err(S3Error::NoSuchUpload);
+        }
+        let bucket_dir = self.safe_bucket_path(bucket)?;
+        let path = bucket_dir.join(UPLOADS_DIR).join(upload_id);
+        super::assert_path_within(&path, &bucket_dir).map_err(|_| S3Error::NoSuchUpload)?;
+        Ok(path)
     }
 
     /// Path to a specific part file.
-    fn part_path(&self, bucket: &str, upload_id: &str, part_number: u32) -> PathBuf {
-        self.upload_path(bucket, upload_id)
-            .join(part_number.to_string())
+    pub(crate) fn part_path(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<PathBuf, S3Error> {
+        Ok(self
+            .upload_path(bucket, upload_id)?
+            .join(part_number.to_string()))
     }
 
     /// Create a new multipart upload. Returns the upload ID.
@@ -70,8 +93,9 @@ impl Storage {
         // Validate key via object_path (also checks path traversal)
         let _ = self.object_path(bucket, key)?;
 
+        self.quota.check_not_exceeded()?;
         let upload_id = uuid::Uuid::new_v4().to_string();
-        let upload_dir = self.upload_path(bucket, &upload_id);
+        let upload_dir = self.upload_path(bucket, &upload_id)?;
         fs::create_dir_all(&upload_dir)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
@@ -87,6 +111,8 @@ impl Storage {
         fs::write(upload_dir.join(META_FILE), &meta_json)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        // Released with the whole upload directory on complete/abort/expiry
+        self.quota.add(meta_json.len() as u64);
 
         Ok(upload_id)
     }
@@ -97,7 +123,7 @@ impl Storage {
         bucket: &str,
         upload_id: &str,
     ) -> Result<UploadMeta, S3Error> {
-        let upload_dir = self.upload_path(bucket, upload_id);
+        let upload_dir = self.upload_path(bucket, upload_id)?;
         let meta_path = upload_dir.join(META_FILE);
         if !is_regular_file(&meta_path).await {
             return Err(S3Error::NoSuchUpload);
@@ -116,29 +142,55 @@ impl Storage {
         part_number: u32,
         body: Incoming,
         aws_chunked: bool,
+        mut reservation: Reservation,
     ) -> Result<String, S3Error> {
         self.head_bucket(bucket).await?;
 
-        let upload_dir = self.upload_path(bucket, upload_id);
+        let upload_dir = self.upload_path(bucket, upload_id)?;
         if !is_real_dir(&upload_dir).await {
             return Err(S3Error::NoSuchUpload);
         }
 
-        let part_path = self.part_path(bucket, upload_id, part_number);
+        let part_path = self.part_path(bucket, upload_id, part_number)?;
         // UUID-based temp file to prevent TOCTOU race conditions
-        let tmp_name = format!("{}.{}.tmp", part_number, uuid::Uuid::new_v4());
-        let tmp_path = upload_dir.join(&tmp_name);
+        let tmp_path = self.tmp_file();
         let mut file = tokio::fs::File::create(&tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
-        let etag =
-            crate::storage::object::stream_body_to_file(&mut file, body, aws_chunked).await?;
+        let (etag, written) = match crate::storage::object::stream_body_to_file(
+            &mut file,
+            body,
+            aws_chunked,
+            &mut reservation,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                drop(file);
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(e);
+            }
+        };
         drop(file);
 
-        fs::rename(&tmp_path, &part_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        // Re-uploading a part number replaces the previous part. Locked on the
+        // upload directory so an abort cannot interleave with the rename.
+        {
+            let _path_guard = self.quota.lock_path(&upload_dir).await;
+            if !is_real_dir(&upload_dir).await {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(S3Error::NoSuchUpload);
+            }
+            let replaced = file_size(&part_path).await;
+            if let Err(e) = fs::rename(&tmp_path, &part_path).await {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(S3Error::InternalError(e.to_string()));
+            }
+            reservation.commit(written);
+            self.quota.release(replaced);
+        }
 
         Ok(etag)
     }
@@ -153,7 +205,7 @@ impl Storage {
     ) -> Result<(String, String), S3Error> {
         self.head_bucket(bucket).await?;
 
-        let upload_dir = self.upload_path(bucket, upload_id);
+        let upload_dir = self.upload_path(bucket, upload_id)?;
         if !is_real_dir(&upload_dir).await {
             return Err(S3Error::NoSuchUpload);
         }
@@ -181,16 +233,8 @@ impl Storage {
                 .map_err(|e| S3Error::InternalError(e.to_string()))?;
         }
 
-        // UUID-based temp file for atomic assembly
-        let tmp_name = format!(
-            "{}.{}.tmp",
-            object_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
-            uuid::Uuid::new_v4()
-        );
-        let tmp_path = object_path.with_file_name(&tmp_name);
+        // Temporary file for atomic assembly
+        let tmp_path = self.tmp_file();
         let mut dst_file = tokio::fs::File::create(&tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
@@ -200,7 +244,7 @@ impl Storage {
         let part_count = parts.len();
 
         for (part_number, expected_etag) in &parts {
-            let part_path = self.part_path(bucket, upload_id, *part_number);
+            let part_path = self.part_path(bucket, upload_id, *part_number)?;
             if !is_regular_file(&part_path).await {
                 let _ = fs::remove_file(&tmp_path).await;
                 return Err(S3Error::InvalidPart);
@@ -248,16 +292,25 @@ impl Storage {
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
         drop(dst_file);
 
-        // Atomic rename
-        fs::rename(&tmp_path, &object_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        // Atomic rename. Parts are already counted in the quota, so assembling
+        // them is space-neutral once the upload directory is removed below.
+        {
+            let _path_guard = self.quota.lock_path(&object_path).await;
+            let assembled = file_size(&tmp_path).await;
+            let replaced = file_size(&object_path).await;
+            if let Err(e) = crate::storage::rename_into(&tmp_path, &object_path).await {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(S3Error::InternalError(e.to_string()));
+            }
+            self.quota.add(assembled);
+            self.quota.release(replaced);
+        }
 
         // S3-style multipart ETag: md5_of_concatenated_part_md5s-part_count
         let composite_etag = format!("\"{:x}-{}\"", md5_of_md5s.finalize(), part_count);
 
         // Clean up upload directory
-        let _ = fs::remove_dir_all(&upload_dir).await;
+        let _ = self.remove_upload_dir(&upload_dir).await;
 
         Ok((meta.key, composite_etag))
     }
@@ -270,15 +323,28 @@ impl Storage {
     ) -> Result<(), S3Error> {
         self.head_bucket(bucket).await?;
 
-        let upload_dir = self.upload_path(bucket, upload_id);
+        let upload_dir = self.upload_path(bucket, upload_id)?;
         if !is_real_dir(&upload_dir).await {
             return Err(S3Error::NoSuchUpload);
         }
 
-        fs::remove_dir_all(&upload_dir)
+        self.remove_upload_dir(&upload_dir).await
+    }
+
+    /// Remove an upload directory and release its size from the quota.
+    async fn remove_upload_dir(&self, upload_dir: &std::path::Path) -> Result<(), S3Error> {
+        let _path_guard = self.quota.lock_path(upload_dir).await;
+        if !is_real_dir(upload_dir).await {
+            return Err(S3Error::NoSuchUpload);
+        }
+        let dir = upload_dir.to_path_buf();
+        let size = tokio::task::spawn_blocking(move || crate::quota::dir_size(&dir))
+            .await
+            .unwrap_or(0);
+        fs::remove_dir_all(upload_dir)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-
+        self.quota.release(size);
         Ok(())
     }
 
@@ -290,7 +356,7 @@ impl Storage {
     ) -> Result<(String, Vec<PartInfo>), S3Error> {
         self.head_bucket(bucket).await?;
 
-        let upload_dir = self.upload_path(bucket, upload_id);
+        let upload_dir = self.upload_path(bucket, upload_id)?;
         if !is_real_dir(&upload_dir).await {
             return Err(S3Error::NoSuchUpload);
         }
@@ -418,7 +484,7 @@ impl Storage {
                 if let Ok(initiated) = chrono::DateTime::parse_from_rfc3339(&meta.initiated) {
                     let age = now.signed_duration_since(initiated);
                     if age.num_seconds() > ttl_secs as i64 {
-                        let _ = fs::remove_dir_all(upload_entry.path()).await;
+                        let _ = self.remove_upload_dir(&upload_entry.path()).await;
                     }
                 } else if let Ok(initiated) =
                     chrono::NaiveDateTime::parse_from_str(&meta.initiated, "%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -426,7 +492,7 @@ impl Storage {
                     let initiated_utc = initiated.and_utc();
                     let age = now.signed_duration_since(initiated_utc);
                     if age.num_seconds() > ttl_secs as i64 {
-                        let _ = fs::remove_dir_all(upload_entry.path()).await;
+                        let _ = self.remove_upload_dir(&upload_entry.path()).await;
                     }
                 }
             }

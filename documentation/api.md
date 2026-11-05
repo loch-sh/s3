@@ -3,6 +3,8 @@
 ## Table of Contents
 
 - [S3 Endpoints](#s3-endpoints)
+- [Service Endpoints — Health and Usage](#service-endpoints--health-and-usage)
+- [Error Codes](#error-codes)
 - [Administration API — User Management](#administration-api--user-management)
 - [Bucket Policies](#bucket-policies)
 - [CORS Configuration](#cors-configuration)
@@ -33,7 +35,7 @@ All S3 endpoints use AWS Signature V4 authentication when the server is configur
 |-----------|--------|------|
 | ListObjectsV2 | `GET` | `/{bucket}?list-type=2` |
 | PutObject | `PUT` | `/{bucket}/{key}` |
-| GetObject | `GET` | `/{bucket}/{key}` |
+| GetObject | `GET` | `/{bucket}/{key}` (supports `Range: bytes=a-b`, `bytes=a-`, `bytes=-n` → `206`; unsatisfiable → `416 InvalidRange`) |
 | HeadObject | `HEAD` | `/{bucket}/{key}` |
 | DeleteObject | `DELETE` | `/{bucket}/{key}` |
 | CopyObject | `PUT` | `/{bucket}/{key}` + `x-amz-copy-source` header |
@@ -80,6 +82,34 @@ All S3 endpoints use AWS Signature V4 authentication when the server is configur
 | PutBucketEncryption | `PUT` | `/{bucket}?encryption` |
 | GetBucketEncryption | `GET` | `/{bucket}?encryption` |
 | DeleteBucketEncryption | `DELETE` | `/{bucket}?encryption` |
+
+---
+
+## Service Endpoints — Health and Usage
+
+| Endpoint | Auth | Response |
+|----------|------|----------|
+| `GET`/`HEAD /_loch/health` | none | `200 {"status":"ok"}`; with a quota: `{"status":"ok","quota":"ok"}` or `"quota":"exceeded"`; `503 {"status":"error"}` if the data directory is unreachable. No figures, names or secrets |
+| `GET /_loch/usage` | SigV4, root only (open when no credentials are configured) | `200 {"used_bytes":N,"reserved_bytes":N,"limit_bytes":N\|null}` |
+
+See [Managed and hardened deployment](deployment.md#health-and-usage-endpoints).
+
+---
+
+## Error Codes
+
+S3 errors are returned as XML (`<Error><Code>…</Code><Message>…</Message>…</Error>`). Codes specific to this server or worth noting:
+
+| Code | HTTP | When |
+|------|------|------|
+| `QuotaExceeded` | 403 | The write would exceed `S3_MAX_STORAGE_BYTES` (PutObject, UploadPart, CopyObject, CompleteMultipartUpload when already over the limit) |
+| `InvalidRange` | 416 | `Range` header outside the object (`Content-Range: bytes */<size>` is returned) |
+| `EntityTooLarge` | 413 | XML/JSON request body or user metadata above its limit |
+| `RequestTimeout` | 400 | Upload body stalled for 60 s |
+| `NoSuchUpload` | 404 | Unknown or malformed `uploadId` |
+| `NoSuchVersion` | 404 | Unknown or malformed `versionId` |
+| `AccessDenied` | 403 | Missing permission, including on the CopyObject source, or `x-amz-copy-source` not signed |
+| `InvalidArgument` | 400 | Malformed input (e.g. malformed aws-chunked body, invalid copy source) |
 
 ---
 

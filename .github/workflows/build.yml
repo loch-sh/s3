@@ -46,14 +46,24 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Install cross (Linux targets)
-        if: matrix.runner == 'ubuntu-latest'
+        if: matrix.runner == 'ubuntu-latest' && !contains(matrix.target, 'windows')
         uses: taiki-e/install-action@v2
         with:
           tool: cross
 
       - name: Build (cross)
-        if: matrix.runner == 'ubuntu-latest'
+        if: matrix.runner == 'ubuntu-latest' && !contains(matrix.target, 'windows')
         run: cross build --release --target ${{ matrix.target }}
+
+      # The cross 0.2.5 Windows image exits without output with the current
+      # stable toolchain: build natively with the MinGW-w64 cross compiler.
+      - name: Install MinGW-w64 (Windows target)
+        if: contains(matrix.target, 'windows')
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Build (MinGW-w64)
+        if: contains(matrix.target, 'windows')
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (cargo)
         if: matrix.runner == 'macos-latest'

@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use super::object::{StoredMetadata, compute_file_md5};
-use super::{
-    INTERNAL_NAMES, Storage, atomic_tmp_path, guess_content_type, is_real_dir, is_regular_file,
-};
+use super::{INTERNAL_NAMES, Storage, guess_content_type, is_real_dir, is_regular_file};
 use crate::encryption::EncryptionMeta;
 use crate::error::S3Error;
 use crate::storage::bucket::format_system_time;
@@ -135,8 +133,10 @@ impl Storage {
 
     /// Path to the versions directory for a given key within a bucket.
     fn versions_key_dir(&self, bucket: &str, key: &str) -> Result<PathBuf, S3Error> {
-        let bucket_dir = self.data_dir.join(bucket);
+        super::validate_object_key(key)?;
+        let bucket_dir = self.safe_bucket_path(bucket)?;
         let path = bucket_dir.join(VERSIONS_DIR).join(key);
+        super::assert_path_within(&path, &bucket_dir)?;
         Ok(path)
     }
 
@@ -152,6 +152,7 @@ impl Storage {
         source_path: &Path,
         meta: &VersionMeta,
     ) -> Result<(), S3Error> {
+        validate_version_id(vid)?;
         let ver_dir = self.versions_key_dir(bucket, key)?;
         fs::create_dir_all(&ver_dir)
             .await
@@ -161,11 +162,11 @@ impl Storage {
         let meta_path = ver_dir.join(format!("{}.meta", vid));
 
         // Atomic copy to .data
-        let tmp_path = atomic_tmp_path(&data_path);
+        let tmp_path = self.tmp_file();
         fs::copy(source_path, &tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        fs::rename(&tmp_path, &data_path)
+        crate::storage::rename_into(&tmp_path, &data_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
@@ -186,6 +187,7 @@ impl Storage {
         key: &str,
         vid: &str,
     ) -> Result<(), S3Error> {
+        validate_version_id(vid)?;
         let ver_dir = self.versions_key_dir(bucket, key)?;
         fs::create_dir_all(&ver_dir)
             .await
@@ -270,11 +272,11 @@ impl Storage {
 
         // Copy file to null.data
         let null_data_path = ver_dir.join("null.data");
-        let tmp_path = atomic_tmp_path(&null_data_path);
+        let tmp_path = self.tmp_file();
         fs::copy(&object_path, &tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        fs::rename(&tmp_path, &null_data_path)
+        crate::storage::rename_into(&tmp_path, &null_data_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
@@ -311,6 +313,7 @@ impl Storage {
         key: &str,
         vid: &str,
     ) -> Result<VersionMeta, S3Error> {
+        validate_version_id(vid)?;
         let ver_dir = self.versions_key_dir(bucket, key)?;
         let meta_path = ver_dir.join(format!("{}.meta", vid));
         if !is_regular_file(&meta_path).await {
@@ -329,6 +332,7 @@ impl Storage {
         key: &str,
         vid: &str,
     ) -> Result<PathBuf, S3Error> {
+        validate_version_id(vid)?;
         let ver_dir = self.versions_key_dir(bucket, key)?;
         let data_path = ver_dir.join(format!("{}.data", vid));
         if !is_regular_file(&data_path).await {
@@ -344,6 +348,7 @@ impl Storage {
         key: &str,
         vid: &str,
     ) -> Result<bool, S3Error> {
+        validate_version_id(vid)?;
         let ver_dir = self.versions_key_dir(bucket, key)?;
         let marker_path = ver_dir.join(format!("{}.marker", vid));
         Ok(is_regular_file(&marker_path).await)
@@ -356,6 +361,7 @@ impl Storage {
         key: &str,
         vid: &str,
     ) -> Result<bool, S3Error> {
+        validate_version_id(vid)?;
         let ver_dir = self.versions_key_dir(bucket, key)?;
 
         let data_path = ver_dir.join(format!("{}.data", vid));
@@ -420,11 +426,11 @@ impl Storage {
                             .await
                             .map_err(|e| S3Error::InternalError(e.to_string()))?;
                     }
-                    let tmp_path = atomic_tmp_path(&object_path);
+                    let tmp_path = self.tmp_file();
                     fs::copy(&data_path, &tmp_path)
                         .await
                         .map_err(|e| S3Error::InternalError(e.to_string()))?;
-                    fs::rename(&tmp_path, &object_path)
+                    crate::storage::rename_into(&tmp_path, &object_path)
                         .await
                         .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
@@ -628,6 +634,26 @@ impl Storage {
     }
 }
 
+/// Reject any version ID that `generate_version_id` cannot have produced
+/// (`{14 digits}-{8 lowercase hex}`) or "null", before it is used in a path.
+pub(crate) fn validate_version_id(vid: &str) -> Result<(), S3Error> {
+    if vid == "null" {
+        return Ok(());
+    }
+    let bytes = vid.as_bytes();
+    let valid = bytes.len() == 23
+        && bytes[..14].iter().all(|b| b.is_ascii_digit())
+        && bytes[14] == b'-'
+        && bytes[15..]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
+    if valid {
+        Ok(())
+    } else {
+        Err(S3Error::NoSuchVersion)
+    }
+}
+
 /// Sort key for version IDs. "null" sorts before everything else.
 fn version_sort_key(vid: &str) -> (u8, &str) {
     if vid == "null" { (0, vid) } else { (1, vid) }
@@ -739,7 +765,7 @@ async fn collect_unversioned_keys(
         let name = entry.file_name().to_string_lossy().to_string();
 
         // Skip internal files
-        if INTERNAL_NAMES.contains(&name.as_str()) || name.ends_with(".tmp") {
+        if INTERNAL_NAMES.contains(&name.as_str()) {
             continue;
         }
 
@@ -781,5 +807,27 @@ async fn is_dir_empty(path: &Path) -> bool {
     match fs::read_dir(path).await {
         Ok(mut entries) => entries.next_entry().await.ok().flatten().is_none(),
         Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_validate_version_id() {
+        use super::validate_version_id;
+        assert!(validate_version_id("null").is_ok());
+        assert!(validate_version_id(&crate::storage::Storage::generate_version_id()).is_ok());
+        assert!(validate_version_id("01730000000000-0a1b2c3d").is_ok());
+        for bad in [
+            "",
+            "../x",
+            "../../../b/k",
+            "01730000000000-0A1B2C3D",
+            "01730000000000-0a1b2c3",
+            "0173000000000a-0a1b2c3d",
+            "01730000000000/0a1b2c3d",
+        ] {
+            assert!(validate_version_id(bad).is_err(), "{bad}");
+        }
     }
 }

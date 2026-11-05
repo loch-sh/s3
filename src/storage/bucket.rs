@@ -26,11 +26,7 @@ const METADATA_FILE: &str = ".metadata";
 
 impl Storage {
     /// Create a new bucket directory with a metadata file.
-    pub async fn create_bucket(
-        &self,
-        name: &str,
-        owner: Option<&str>,
-    ) -> Result<(), S3Error> {
+    pub async fn create_bucket(&self, name: &str, owner: Option<&str>) -> Result<(), S3Error> {
         let bucket_path = self.safe_bucket_path(name)?;
         // Atomic creation: create_dir fails with AlreadyExists, no TOCTOU race
         match fs::create_dir(&bucket_path).await {
@@ -132,6 +128,10 @@ impl Storage {
             // Only include real directories (not symlinks)
             if meta.is_dir() && !meta.file_type().is_symlink() {
                 let name = entry.file_name().to_string_lossy().to_string();
+                // Internal directories (e.g. .loch-tmp) are not buckets
+                if super::validate_bucket_name(&name).is_err() {
+                    continue;
+                }
                 let owner = self.get_bucket_owner(&name).await.unwrap_or(None);
                 let creation_date = read_bucket_creation_date(&entry.path()).await;
                 buckets.push(BucketInfo {

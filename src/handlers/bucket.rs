@@ -30,7 +30,10 @@ pub async fn create_bucket(
 
 /// DELETE /{bucket} — Delete a bucket.
 pub async fn delete_bucket(storage: Arc<Storage>, bucket: &str) -> Response<BoxBody> {
-    match storage.delete_bucket(bucket).await {
+    let result = storage.delete_bucket(bucket).await;
+    // Leftover internal files (metadata, versions, uploads) were removed with the bucket
+    storage.quota.mark_dirty();
+    match result {
         Ok(()) => empty_response(StatusCode::NO_CONTENT),
         Err(e) => error_response(e, &format!("/{}", bucket)),
     }

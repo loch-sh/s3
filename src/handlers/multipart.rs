@@ -62,6 +62,22 @@ pub async fn create_multipart_upload(
     }
 }
 
+/// Load an upload's metadata and check that it belongs to `key`.
+/// Authorization is evaluated on the key of the request URL, so an upload
+/// initiated for another key is reported as `NoSuchUpload`.
+async fn upload_meta_for_key(
+    storage: &Storage,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<crate::storage::multipart::UploadMeta, S3Error> {
+    let meta = storage.get_upload_meta(bucket, upload_id).await?;
+    if meta.key != key {
+        return Err(S3Error::NoSuchUpload);
+    }
+    Ok(meta)
+}
+
 /// PUT /{bucket}/{key}?partNumber=N&uploadId=X -- Upload a part.
 pub async fn upload_part(
     config: Arc<ServerConfig>,
@@ -75,7 +91,7 @@ pub async fn upload_part(
     let resource = format!("/{}/{}", bucket, key);
 
     // If upload uses SSE-C, verify the key matches
-    let upload_meta = match storage.get_upload_meta(bucket, upload_id).await {
+    let upload_meta = match upload_meta_for_key(storage, bucket, key, upload_id).await {
         Ok(m) => m,
         Err(e) => return error_response(e, &resource),
     };
@@ -107,10 +123,23 @@ pub async fn upload_part(
     }
 
     let aws_chunked = crate::handlers::object::is_aws_chunked(&req);
+    // Reserve quota up front for the declared size, then per chunk while streaming
+    let mut reservation = storage.quota.reservation(1);
+    let declared = crate::handlers::object::declared_payload_length(&req).unwrap_or(0);
+    if let Err(e) = reservation.ensure(declared) {
+        return error_response(e, &resource);
+    }
     let body = req.into_body();
     // Parts are stored as plaintext; encryption happens at CompleteMultipartUpload
     match storage
-        .upload_part(bucket, upload_id, part_number, body, aws_chunked)
+        .upload_part(
+            bucket,
+            upload_id,
+            part_number,
+            body,
+            aws_chunked,
+            reservation,
+        )
         .await
     {
         Ok(etag) => etag_response(&etag),
@@ -131,7 +160,7 @@ pub async fn complete_multipart_upload(
     let resource = format!("/{}/{}", bucket, key);
 
     // Read upload metadata to check SSE settings
-    let upload_meta = match storage.get_upload_meta(bucket, upload_id).await {
+    let upload_meta = match upload_meta_for_key(storage, bucket, key, upload_id).await {
         Ok(m) => m,
         Err(e) => return error_response(e, &resource),
     };
@@ -182,6 +211,13 @@ pub async fn complete_multipart_upload(
         .map(|p| (p.part_number, p.etag))
         .collect();
 
+    // Parts already count toward the quota, so assembling them is space-neutral
+    // (the upload directory is removed once the object is in place). Completion is
+    // only refused when usage is already above the limit (e.g. the limit was lowered).
+    if let Err(e) = storage.quota.check_not_exceeded() {
+        return error_response(e, &resource);
+    }
+
     match storage
         .complete_multipart_upload(bucket, upload_id, parts)
         .await
@@ -204,7 +240,13 @@ pub async fn complete_multipart_upload(
                         Ok(p) => p,
                         Err(e) => return error_response(e, &resource),
                     };
-                    match encryption::encrypt_sse_s3(&object_path, &enc_config.master_key).await {
+                    match encryption::encrypt_sse_s3(
+                        &object_path,
+                        &storage.tmp_file(),
+                        &enc_config.master_key,
+                    )
+                    .await
+                    {
                         Ok(meta) => Some(meta),
                         Err(e) => return error_response(e, &resource),
                     }
@@ -216,7 +258,14 @@ pub async fn complete_multipart_upload(
                         Ok(p) => p,
                         Err(e) => return error_response(e, &resource),
                     };
-                    match encryption::encrypt_sse_c(&object_path, &cust_key, &cust_md5).await {
+                    match encryption::encrypt_sse_c(
+                        &object_path,
+                        &storage.tmp_file(),
+                        &cust_key,
+                        &cust_md5,
+                    )
+                    .await
+                    {
                         Ok(meta) => Some(meta),
                         Err(e) => return error_response(e, &resource),
                     }
@@ -260,6 +309,9 @@ pub async fn abort_multipart_upload(
     key: &str,
     upload_id: &str,
 ) -> Response<BoxBody> {
+    if let Err(e) = upload_meta_for_key(&storage, bucket, key, upload_id).await {
+        return error_response(e, &format!("/{}/{}", bucket, key));
+    }
     match storage.abort_multipart_upload(bucket, upload_id).await {
         Ok(()) => empty_response(StatusCode::NO_CONTENT),
         Err(e) => error_response(e, &format!("/{}/{}", bucket, key)),
@@ -273,6 +325,9 @@ pub async fn list_parts(
     key: &str,
     upload_id: &str,
 ) -> Response<BoxBody> {
+    if let Err(e) = upload_meta_for_key(&storage, bucket, key, upload_id).await {
+        return error_response(e, &format!("/{}/{}", bucket, key));
+    }
     match storage.list_parts(bucket, upload_id).await {
         Ok((_key, parts)) => {
             let result = xml::ListPartsResult {

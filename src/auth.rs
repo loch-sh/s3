@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use hyper::Request;
 use hyper::body::Incoming;
 use sha2::{Digest, Sha256};
@@ -29,6 +29,32 @@ pub struct AuthenticatedUser {
 /// Returns true if the request uses presigned URL (query-string) authentication.
 pub fn is_presigned_request(query: &str) -> bool {
     query.split('&').any(|p| p.starts_with("X-Amz-Algorithm="))
+}
+
+/// Names (lowercase) of the headers covered by the request signature, taken from
+/// `X-Amz-SignedHeaders` (presigned URL) or the `Authorization` header.
+/// Only meaningful once `verify_request` has succeeded.
+pub fn signed_header_names(req: &Request<Incoming>) -> Vec<String> {
+    let query = req.uri().query().unwrap_or("");
+    let raw = if is_presigned_request(query) {
+        query
+            .split('&')
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| *k == "X-Amz-SignedHeaders")
+            .map(|(_, v)| uri_decode(v))
+    } else {
+        req.headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_auth_header)
+            .map(|h| h.signed_headers.join(";"))
+    };
+    raw.map(|v| {
+        v.split(';')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Verify the AWS Signature Version 4 on an incoming request.
@@ -516,10 +542,7 @@ mod tests {
         let result = canonical_query_string(query, Some("X-Amz-Signature"));
         assert!(!result.contains("X-Amz-Signature"));
         assert!(result.contains("X-Amz-Algorithm"));
-        assert_eq!(
-            result,
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&a=1&b=2"
-        );
+        assert_eq!(result, "X-Amz-Algorithm=AWS4-HMAC-SHA256&a=1&b=2");
     }
 
     #[test]

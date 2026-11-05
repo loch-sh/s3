@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{INTERNAL_NAMES, Storage, atomic_tmp_path, guess_content_type, is_regular_file};
+use super::{INTERNAL_NAMES, Storage, guess_content_type, is_regular_file};
 use crate::encryption::EncryptionMeta;
 use crate::error::S3Error;
+use crate::quota::{Reservation, file_size};
 
 const META_DIR: &str = ".meta";
 
@@ -88,6 +89,7 @@ impl Storage {
         key: &str,
         body: Incoming,
         aws_chunked: bool,
+        mut reservation: Reservation,
     ) -> Result<String, S3Error> {
         self.head_bucket(bucket).await?;
 
@@ -99,17 +101,32 @@ impl Storage {
         }
 
         // UUID-based temp file to prevent TOCTOU race conditions
-        let tmp_path = atomic_tmp_path(&object_path);
+        let tmp_path = self.tmp_file();
         let mut file = tokio::fs::File::create(&tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
-        let etag = stream_body_to_file(&mut file, body, aws_chunked).await?;
+        let (etag, written) =
+            match stream_body_to_file(&mut file, body, aws_chunked, &mut reservation).await {
+                Ok(r) => r,
+                Err(e) => {
+                    drop(file);
+                    let _ = fs::remove_file(&tmp_path).await;
+                    return Err(e);
+                }
+            };
         drop(file);
 
-        fs::rename(&tmp_path, &object_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        {
+            let _path_guard = self.quota.lock_path(&object_path).await;
+            let replaced = file_size(&object_path).await;
+            if let Err(e) = crate::storage::rename_into(&tmp_path, &object_path).await {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(S3Error::InternalError(e.to_string()));
+            }
+            reservation.commit(written);
+            self.quota.release(replaced);
+        }
 
         Ok(etag)
     }
@@ -184,9 +201,16 @@ impl Storage {
 
         let object_path = self.object_path(bucket, key)?;
         if is_regular_file(&object_path).await {
-            fs::remove_file(&object_path)
-                .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
+            {
+                let _path_guard = self.quota.lock_path(&object_path).await;
+                let size = file_size(&object_path).await;
+                match fs::remove_file(&object_path).await {
+                    Ok(()) => self.quota.release(size),
+                    // Removed concurrently: already released by the other request
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(S3Error::InternalError(e.to_string())),
+                }
+            }
 
             // Clean up empty parent directories (but not the bucket root)
             let bucket_root = self.data_dir.join(bucket);
@@ -234,11 +258,11 @@ impl Storage {
         }
 
         // UUID-based temp file for atomic copy
-        let tmp_path = atomic_tmp_path(&dst_path);
+        let tmp_path = self.tmp_file();
         fs::copy(&src_path, &tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        fs::rename(&tmp_path, &dst_path)
+        crate::storage::rename_into(&tmp_path, &dst_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
@@ -298,13 +322,14 @@ impl Storage {
         }
         let json =
             serde_json::to_vec(metadata).map_err(|e| S3Error::InternalError(e.to_string()))?;
-        let tmp_path = meta_path.with_extension("json.tmp");
+        let tmp_path = self.tmp_file();
         fs::write(&tmp_path, &json)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        fs::rename(&tmp_path, &meta_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        if let Err(e) = crate::storage::rename_into(&tmp_path, &meta_path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(S3Error::InternalError(e.to_string()));
+        }
         Ok(())
     }
 
@@ -478,7 +503,7 @@ async fn collect_keys(
         }
 
         // Skip internal files and directories
-        if INTERNAL_NAMES.contains(&name.as_str()) || name.ends_with(".tmp") {
+        if INTERNAL_NAMES.contains(&name.as_str()) {
             continue;
         }
 
@@ -507,38 +532,58 @@ async fn collect_keys(
 }
 
 /// Stream an HTTP body to a file, computing MD5 incrementally.
-/// If `aws_chunked` is true, the body is first collected and decoded from
-/// the AWS chunked transfer encoding before writing.
-/// Returns the MD5 ETag (quoted hex digest).
+/// If `aws_chunked` is true, the body is decoded from the AWS chunked transfer
+/// encoding on the fly (constant memory; trailing headers such as
+/// `x-amz-checksum-*` are ignored).
+/// Bytes are reserved against the storage quota before being written: the
+/// upload stops with `QuotaExceeded` as soon as the quota would be crossed.
+/// Returns the MD5 ETag (quoted hex digest) and the number of bytes written.
 pub(crate) async fn stream_body_to_file(
     file: &mut tokio::fs::File,
     mut body: Incoming,
     aws_chunked: bool,
-) -> Result<String, S3Error> {
+    reservation: &mut Reservation,
+) -> Result<(String, u64), S3Error> {
     let mut md5_ctx = md5::Context::new();
+    let mut decoder = aws_chunked.then(AwsChunkedDecoder::new);
+    let mut decoded = Vec::new();
+    let mut total: u64 = 0;
 
-    if aws_chunked {
-        let mut raw = Vec::new();
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| S3Error::InternalError(e.to_string()))?;
-            if let Ok(data) = frame.into_data() {
-                raw.extend_from_slice(&data);
+    loop {
+        // A client that stops sending must not hold its quota reservation forever
+        let frame = match tokio::time::timeout(BODY_IDLE_TIMEOUT, body.frame()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => return Err(S3Error::RequestTimeout),
+        };
+        let frame = frame.map_err(|e| S3Error::InternalError(e.to_string()))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let payload: &[u8] = match decoder.as_mut() {
+            Some(dec) => {
+                decoded.clear();
+                dec.feed(&data, &mut decoded)?;
+                &decoded
             }
+            None => &data,
+        };
+        if payload.is_empty() {
+            continue;
         }
-        let decoded = decode_aws_chunked(&raw);
-        md5_ctx.consume(&decoded);
-        file.write_all(&decoded)
+        reservation.ensure(total + payload.len() as u64)?;
+        md5_ctx.consume(payload);
+        file.write_all(payload)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-    } else {
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| S3Error::InternalError(e.to_string()))?;
-            if let Ok(data) = frame.into_data() {
-                md5_ctx.consume(&data);
-                file.write_all(&data)
-                    .await
-                    .map_err(|e| S3Error::InternalError(e.to_string()))?;
-            }
+        total += payload.len() as u64;
+    }
+
+    if let Some(dec) = decoder {
+        if !dec.is_complete() {
+            return Err(S3Error::InvalidArgument(
+                "Incomplete aws-chunked body (missing final chunk).".to_string(),
+            ));
         }
     }
 
@@ -546,61 +591,102 @@ pub(crate) async fn stream_body_to_file(
         .await
         .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
-    Ok(format!("\"{:x}\"", md5_ctx.finalize()))
+    Ok((format!("\"{:x}\"", md5_ctx.finalize()), total))
 }
 
-/// Decode an AWS chunked transfer encoded body.
-/// Format: <hex-size>[;chunk-extension...]\r\n<data>\r\n ... 0[;...]\r\n[trailers]\r\n
-fn decode_aws_chunked(data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut pos = 0;
+/// Maximum time without receiving any body data before an upload is aborted.
+const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-    loop {
-        if pos >= data.len() {
-            break;
-        }
+/// Maximum length of a chunk-size line (`<hex>;chunk-signature=<64 hex>`).
+const MAX_CHUNK_HEADER: usize = 4096;
 
-        // Find end of chunk-size line
-        let line_end = match find_crlf(data, pos) {
-            Some(i) => i,
-            None => break,
-        };
-
-        // Parse chunk size (ignore extensions after ';')
-        let line = &data[pos..line_end];
-        let size_part = match line.iter().position(|&b| b == b';') {
-            Some(i) => &line[..i],
-            None => line,
-        };
-        let size_str = std::str::from_utf8(size_part).unwrap_or("0").trim();
-        let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
-
-        pos = line_end + 2; // skip \r\n
-
-        if chunk_size == 0 {
-            break; // final chunk, ignore trailers
-        }
-
-        // Read chunk data — use saturating_add to prevent wrapping overflow on
-        // maliciously large chunk-size values (which would make end < pos and panic).
-        let end = pos.saturating_add(chunk_size).min(data.len());
-        result.extend_from_slice(&data[pos..end]);
-        pos = end.saturating_add(2); // skip data + \r\n
-    }
-
-    result
+enum ChunkState {
+    /// Reading a `<hex-size>[;extensions]\r\n` line.
+    Header,
+    /// Reading chunk data; bytes remaining.
+    Data(u64),
+    /// Expecting the `\r\n` after chunk data; bytes remaining (2 then 1).
+    DataEnd(u8),
+    /// Final 0-size chunk seen: trailers (checksums, trailer signature) are ignored.
+    Done,
 }
 
-/// Find the position of the next \r\n in data starting from `start`.
-fn find_crlf(data: &[u8], start: usize) -> Option<usize> {
-    let mut i = start;
-    while i + 1 < data.len() {
-        if data[i] == b'\r' && data[i + 1] == b'\n' {
-            return Some(i);
+/// Incremental decoder for the AWS chunked transfer encoding
+/// (`<hex-size>[;ext]\r\n<data>\r\n ... 0[;ext]\r\n[trailers]\r\n`).
+struct AwsChunkedDecoder {
+    state: ChunkState,
+    header: Vec<u8>,
+}
+
+impl AwsChunkedDecoder {
+    fn new() -> Self {
+        Self {
+            state: ChunkState::Header,
+            header: Vec::new(),
         }
-        i += 1;
     }
-    None
+
+    /// True once the final zero-size chunk has been read.
+    fn is_complete(&self) -> bool {
+        matches!(self.state, ChunkState::Done)
+    }
+
+    /// Decode `input`, appending payload bytes to `out`.
+    fn feed(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), S3Error> {
+        let malformed = || S3Error::InvalidArgument("Malformed aws-chunked body.".to_string());
+        while !input.is_empty() {
+            match self.state {
+                ChunkState::Header => {
+                    let Some(pos) = input.iter().position(|&b| b == b'\n') else {
+                        self.header.extend_from_slice(input);
+                        if self.header.len() > MAX_CHUNK_HEADER {
+                            return Err(malformed());
+                        }
+                        return Ok(());
+                    };
+                    self.header.extend_from_slice(&input[..pos]);
+                    input = &input[pos + 1..];
+                    if self.header.len() > MAX_CHUNK_HEADER {
+                        return Err(malformed());
+                    }
+                    let line = std::str::from_utf8(&self.header).map_err(|_| malformed())?;
+                    let line = line.strip_suffix('\r').unwrap_or(line);
+                    let size_str = line.split(';').next().unwrap_or("").trim();
+                    let size = u64::from_str_radix(size_str, 16).map_err(|_| malformed())?;
+                    self.header.clear();
+                    self.state = if size == 0 {
+                        ChunkState::Done
+                    } else {
+                        ChunkState::Data(size)
+                    };
+                }
+                ChunkState::Data(remaining) => {
+                    let n = remaining.min(input.len() as u64) as usize;
+                    out.extend_from_slice(&input[..n]);
+                    input = &input[n..];
+                    self.state = if remaining == n as u64 {
+                        ChunkState::DataEnd(2)
+                    } else {
+                        ChunkState::Data(remaining - n as u64)
+                    };
+                }
+                ChunkState::DataEnd(remaining) => {
+                    let expected = if remaining == 2 { b'\r' } else { b'\n' };
+                    if input[0] != expected {
+                        return Err(malformed());
+                    }
+                    input = &input[1..];
+                    self.state = if remaining == 1 {
+                        ChunkState::Header
+                    } else {
+                        ChunkState::DataEnd(1)
+                    };
+                }
+                ChunkState::Done => return Ok(()),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Compute MD5 ETag by streaming through a file in chunks.
@@ -621,4 +707,59 @@ pub(crate) async fn compute_file_md5(path: &std::path::Path) -> Result<String, S
         ctx.consume(&buf[..n]);
     }
     Ok(format!("\"{:x}\"", ctx.finalize()))
+}
+
+#[cfg(test)]
+mod aws_chunked_tests {
+    use super::AwsChunkedDecoder;
+
+    fn decode_in_pieces(body: &[u8], piece: usize) -> Vec<u8> {
+        let mut dec = AwsChunkedDecoder::new();
+        let mut out = Vec::new();
+        for chunk in body.chunks(piece) {
+            dec.feed(chunk, &mut out).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn test_decode_signed_chunks_with_trailer() {
+        let sig = "a".repeat(64);
+        let body = format!(
+            "5;chunk-signature={sig}\r\nhello\r\n6;chunk-signature={sig}\r\n world\r\n0;chunk-signature={sig}\r\nx-amz-checksum-crc64nvme:AAAAAAAAAAA=\r\n\r\n"
+        );
+        for piece in [1, 2, 3, 7, 64, body.len()] {
+            assert_eq!(decode_in_pieces(body.as_bytes(), piece), b"hello world");
+        }
+    }
+
+    #[test]
+    fn test_decode_unsigned_chunks() {
+        let body = b"3\r\nabc\r\n0\r\n\r\n";
+        assert_eq!(decode_in_pieces(body, 1), b"abc");
+    }
+
+    #[test]
+    fn test_decode_requires_crlf_and_final_chunk() {
+        let mut out = Vec::new();
+        assert!(
+            AwsChunkedDecoder::new()
+                .feed(b"3\r\nabcXY4\r\n", &mut out)
+                .is_err()
+        );
+        let mut dec = AwsChunkedDecoder::new();
+        dec.feed(b"3\r\nabc\r\n", &mut out).unwrap();
+        assert!(!dec.is_complete());
+        dec.feed(b"0\r\n\r\n", &mut out).unwrap();
+        assert!(dec.is_complete());
+    }
+
+    #[test]
+    fn test_decode_rejects_malformed_header() {
+        let mut dec = AwsChunkedDecoder::new();
+        let mut out = Vec::new();
+        assert!(dec.feed(b"zz\r\nabc", &mut out).is_err());
+        let mut dec = AwsChunkedDecoder::new();
+        assert!(dec.feed(&vec![b'1'; 5000], &mut out).is_err());
+    }
 }

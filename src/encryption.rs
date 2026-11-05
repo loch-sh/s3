@@ -271,7 +271,7 @@ fn encrypt_chunk(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, S3Error> {
     let nonce_bytes = chunk_nonce(base_nonce, chunk_index);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = &Nonce::from(nonce_bytes);
     cipher
         .encrypt(nonce, plaintext)
         .map_err(|_| S3Error::InternalError("Encryption failed.".to_string()))
@@ -285,7 +285,7 @@ fn decrypt_chunk(
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, S3Error> {
     let nonce_bytes = chunk_nonce(base_nonce, chunk_index);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = &Nonce::from(nonce_bytes);
     cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| S3Error::AccessDenied)
@@ -295,6 +295,7 @@ fn decrypt_chunk(
 /// Returns the plaintext size.
 pub async fn encrypt_file_in_place(
     path: &Path,
+    tmp_path: &Path,
     key: &[u8; 32],
     base_nonce: &[u8; 12],
 ) -> Result<u64, S3Error> {
@@ -305,8 +306,7 @@ pub async fn encrypt_file_in_place(
         .await
         .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
-    let tmp_path = path.with_extension("enc.tmp");
-    let mut writer = tokio::fs::File::create(&tmp_path)
+    let mut writer = tokio::fs::File::create(tmp_path)
         .await
         .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
@@ -334,9 +334,10 @@ pub async fn encrypt_file_in_place(
         .map_err(|e| S3Error::InternalError(e.to_string()))?;
     drop(writer);
 
-    tokio::fs::rename(&tmp_path, path)
-        .await
-        .map_err(|e| S3Error::InternalError(e.to_string()))?;
+    if let Err(e) = crate::storage::rename_into(tmp_path, path).await {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        return Err(S3Error::InternalError(e.to_string()));
+    }
 
     Ok(plaintext_size)
 }
@@ -398,6 +399,26 @@ pub fn build_decrypting_body(
     base_nonce: [u8; 12],
     plaintext_size: u64,
 ) -> crate::handlers::BoxBody {
+    build_decrypting_range_body(file, key, base_nonce, plaintext_size, 0, plaintext_size)
+}
+
+/// Offset of the encrypted chunk holding plaintext offset `plain_offset`, and that chunk's index.
+pub fn ciphertext_chunk_for(plain_offset: u64) -> (u64, u64) {
+    let index = plain_offset / CHUNK_SIZE as u64;
+    (index * (CHUNK_SIZE + TAG_SIZE) as u64, index)
+}
+
+/// Build a decrypting body for the plaintext byte range `[start, start + len)`.
+/// `file` must already be positioned at `ciphertext_chunk_for(start).0`: only the
+/// chunks covering the range are read and decrypted.
+pub fn build_decrypting_range_body(
+    file: tokio::fs::File,
+    key: [u8; 32],
+    base_nonce: [u8; 12],
+    plaintext_size: u64,
+    start: u64,
+    len: u64,
+) -> crate::handlers::BoxBody {
     use futures_util::stream::Stream;
     use http_body_util::StreamBody;
     use hyper::body::Frame;
@@ -413,6 +434,10 @@ pub fn build_decrypting_body(
         remaining: u64,
         buf: Vec<u8>,
         done: bool,
+        /// Plaintext bytes to drop at the start of the first decrypted chunk.
+        skip: usize,
+        /// Plaintext bytes still to emit.
+        to_emit: u64,
     }
 
     impl Stream for DecryptStream {
@@ -420,7 +445,7 @@ pub fn build_decrypting_body(
 
         fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             let this = self.get_mut();
-            if this.done || this.remaining == 0 {
+            if this.done || this.remaining == 0 || this.to_emit == 0 {
                 return Poll::Ready(None);
             }
 
@@ -467,9 +492,17 @@ pub fn build_decrypting_body(
                 &this.buf[..filled],
             ) {
                 Ok(plaintext) => {
-                    this.remaining -= plaintext.len() as u64;
+                    this.remaining = this.remaining.saturating_sub(plaintext.len() as u64);
                     this.chunk_index += 1;
-                    Poll::Ready(Some(Ok(Frame::data(bytes::Bytes::from(plaintext)))))
+                    let mut data = bytes::Bytes::from(plaintext);
+                    let skip = this.skip.min(data.len());
+                    let _ = data.split_to(skip);
+                    this.skip = 0;
+                    if (data.len() as u64) > this.to_emit {
+                        data.truncate(this.to_emit as usize);
+                    }
+                    this.to_emit -= data.len() as u64;
+                    Poll::Ready(Some(Ok(Frame::data(data))))
                 }
                 Err(_) => {
                     this.done = true;
@@ -484,14 +517,18 @@ pub fn build_decrypting_body(
 
     let cipher = Aes256Gcm::new_from_slice(&key).expect("valid key size");
 
+    let (_, first_chunk) = ciphertext_chunk_for(start);
+    let chunk_start = first_chunk * CHUNK_SIZE as u64;
     let stream = DecryptStream {
         reader: file,
         cipher,
         base_nonce,
-        chunk_index: 0,
-        remaining: plaintext_size,
+        chunk_index: first_chunk,
+        remaining: plaintext_size.saturating_sub(chunk_start),
         buf: vec![0u8; CHUNK_SIZE + TAG_SIZE],
         done: false,
+        skip: (start - chunk_start) as usize,
+        to_emit: len,
     };
 
     use http_body_util::BodyExt;
@@ -499,12 +536,17 @@ pub fn build_decrypting_body(
 }
 
 /// Encrypt an object at path using SSE-S3. Returns EncryptionMeta.
-pub async fn encrypt_sse_s3(path: &Path, master_key: &[u8; 32]) -> Result<EncryptionMeta, S3Error> {
+/// `tmp_path` is the temporary file used for the atomic rewrite (`Storage::tmp_file`).
+pub async fn encrypt_sse_s3(
+    path: &Path,
+    tmp_path: &Path,
+    master_key: &[u8; 32],
+) -> Result<EncryptionMeta, S3Error> {
     let salt: [u8; 32] = rand_bytes();
     let nonce: [u8; 12] = rand_bytes();
     let dek = derive_sse_s3_key(master_key, &salt);
 
-    let plaintext_size = encrypt_file_in_place(path, &dek, &nonce).await?;
+    let plaintext_size = encrypt_file_in_place(path, tmp_path, &dek, &nonce).await?;
 
     Ok(EncryptionMeta {
         algorithm: SseAlgorithm::SseS3,
@@ -518,12 +560,13 @@ pub async fn encrypt_sse_s3(path: &Path, master_key: &[u8; 32]) -> Result<Encryp
 /// Encrypt an object at path using SSE-C. Returns EncryptionMeta.
 pub async fn encrypt_sse_c(
     path: &Path,
+    tmp_path: &Path,
     customer_key: &[u8; 32],
     customer_key_md5: &str,
 ) -> Result<EncryptionMeta, S3Error> {
     let nonce: [u8; 12] = rand_bytes();
 
-    let plaintext_size = encrypt_file_in_place(path, customer_key, &nonce).await?;
+    let plaintext_size = encrypt_file_in_place(path, tmp_path, customer_key, &nonce).await?;
 
     Ok(EncryptionMeta {
         algorithm: SseAlgorithm::SseC,

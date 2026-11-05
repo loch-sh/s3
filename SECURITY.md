@@ -184,6 +184,77 @@ This document describes the security vulnerabilities that were identified during
 
 **Files:** `src/router.rs`
 
+### 17. CopyObject Source Not Authorized for Authenticated Users (CWE-862) — CRITICAL
+
+**Risk:** `check_auth` only evaluated the destination bucket, and the source check of §14 only applied to anonymous requests. Any authenticated user could copy another user's private object (with or without `?versionId=`) into a bucket they own and read it, SSE-S3 objects being decrypted on the way. A presigned PUT URL could also be turned into a copy by adding an unsigned `x-amz-copy-source` header.
+
+**Mitigation:**
+- `authorize_copy_source` (`router.rs`) applies to the source the same GetObject check as a direct GET: root, source bucket owner, bucket policy for the user ARN, or anonymous policy/ACL. Otherwise `403 AccessDenied`
+- The router and `copy_object` share one parser (`parse_copy_source`), so the authorized object is exactly the object copied (same URL decoding)
+- For signed requests (header or presigned), `x-amz-copy-source` must be one of the signed headers
+
+**Files:** `src/router.rs`, `src/auth.rs`, `src/handlers/object.rs`
+
+### 18. Path Traversal via `uploadId` (CWE-22) — CRITICAL
+
+**Risk:** `upload_path` joined the raw `uploadId` query value to the bucket path. `AbortMultipartUpload` with `uploadId=../../other-bucket` deleted another bucket with `remove_dir_all`; `../..` deleted the whole data directory (including a users file stored there). Upload part, list parts and complete were affected too.
+
+**Mitigation:**
+- `uploadId` must be a canonical lowercase hyphenated UUID (the only format the server generates), otherwise `404 NoSuchUpload`, before any path is built
+- The final path is built from `safe_bucket_path` and checked with `assert_path_within`
+
+**Files:** `src/storage/multipart.rs`
+
+### 19. Path Traversal via `versionId` (CWE-22) — CRITICAL
+
+**Risk:** Version files were built with `ver_dir.join(format!("{}.data", vid))` from the raw `versionId`. `DELETE ?versionId=../../../other-bucket/report` deleted `report.data` in another bucket; GET/HEAD/copy could read outside the versions directory.
+
+**Mitigation:**
+- `validate_version_id` only accepts `null` or the exact format produced by `generate_version_id` (`{14 digits}-{8 lowercase hex}`), otherwise `404 NoSuchVersion`, in every function that takes a version ID
+- `versions_key_dir` validates the object key and checks containment in the bucket
+
+**Files:** `src/storage/versioning.rs`
+
+### 20. Credentials Written to Logs (CWE-532) — HIGH
+
+**Risk:** Every request header was printed to stderr before routing: `Authorization` (SigV4 signatures, `Bearer` admin API key), SSE-C customer keys (`x-amz-server-side-encryption-customer-key`), and the query string with presigned `X-Amz-Signature`.
+
+**Mitigation:** only the method, the path without query string and the response status are logged. Health probes are not logged.
+
+**Files:** `src/router.rs`
+
+### 21. aws-chunked Bodies Buffered in Memory (CWE-400) — MEDIUM
+
+**Risk:** aws-chunked uploads (the default of recent AWS SDKs) were collected in full in memory before decoding: one large upload could exhaust the memory of a container.
+
+**Mitigation:** the body is decoded on the fly by an incremental decoder (`AwsChunkedDecoder`) with constant memory; chunk header lines are limited to 4 096 bytes, malformed bodies are rejected with `400 InvalidArgument`.
+
+**Files:** `src/storage/object.rs`
+
+### 22. Unbounded Disk Usage (CWE-400) — MEDIUM
+
+**Risk:** No limit on the data directory size: one tenant could fill the host disk.
+
+**Mitigation:** optional `S3_MAX_STORAGE_BYTES` quota enforced before bytes are written (reservations under a single lock, so concurrent uploads cannot exceed it together); refused writes return `403 QuotaExceeded` and leave no temporary file. Temporary files live in `{data_dir}/.loch-tmp/`, which no bucket or key can collide with: interrupted writes are removed at startup without ever touching objects whose key ends in `.tmp`, and such objects are counted like any other.
+
+**Files:** `src/quota/mod.rs`, `src/storage/object.rs`, `src/storage/multipart.rs`, `src/handlers/object.rs`, `src/handlers/multipart.rs`, `src/main.rs`
+
+### 23. Multipart Upload Not Bound to Its Key (CWE-639) — MEDIUM
+
+**Risk:** multipart operations were authorized on the key of the request URL, while `CompleteMultipartUpload` writes to the key recorded at initiation. A user allowed to write only `pub/*` could list uploads (`?uploads`), then complete, overwrite parts of or abort another user's upload targeting `secret/*` by sending it through `pub/x?uploadId=…`.
+
+**Mitigation:** UploadPart, CompleteMultipartUpload, AbortMultipartUpload and ListParts load the upload metadata first and return `404 NoSuchUpload` when its key differs from the URL key.
+
+**Files:** `src/handlers/multipart.rs`
+
+### 24. Slow Clients Holding Connections and Quota (CWE-400) — MEDIUM
+
+**Risk:** no header or body timeouts: a client could keep connections open indefinitely (slowloris), or declare a large `Content-Length` and stall, holding a quota reservation that blocks other writers.
+
+**Mitigation:** HTTP/1 request headers must arrive within 30 s (`header_read_timeout`); an upload body that sends no data for 60 s is aborted with `400 RequestTimeout`, releasing its reservation. The tokio blocking pool is capped (`S3_MAX_BLOCKING_THREADS`, default 32) to stay within container PID limits.
+
+**Files:** `src/lib.rs`, `src/storage/object.rs`, `src/main.rs`
+
 ## Presigned URLs
 
 Presigned URLs embed SigV4 authentication in the query string, enabling time-limited access to specific objects without requiring the caller to have AWS credentials.
@@ -344,12 +415,29 @@ All direct and transitive dependencies are free of known CVEs as of this date.
 | Finding | Severity | Status |
 |---------|----------|--------|
 | Presigned URL invalid-auth bypass (CWE-287) | Moderate | Fixed — §13 above |
-| `aws_chunked` upload buffered in memory | Low | Known — chunked-encoded bodies are buffered in full before streaming to disk; only affects AWS SDK streaming uploads. Mitigated by OS-level connection limits. |
+| `aws_chunked` upload buffered in memory | Low | Fixed in 1.3.0 — §21 (streaming decoder) |
 | `aws_chunked` chunk-size integer overflow → panic (CWE-190) | Medium | Fixed — §15 above (`saturating_add`) |
 | CopyObject anonymous source authorization bypass (CWE-862) | High | Fixed — §14 above (source bucket policy/ACL check for anonymous requests) |
 | Unbounded user metadata (CWE-400) | Low | Fixed — §16 above (2 048-byte limit, returns 413) |
 | `ListObjects` ETag/size discrepancy for encrypted objects | Informational | Known — `ListObjects` reports ciphertext size and MD5; `HeadObject` / `GetObject` report plaintext size and plaintext MD5. Correctness gap, not a security issue. |
 | `X-Amz-Expires` has no server-side upper bound | Low | Fixed — values `0` or `> 604 800 s` are rejected with 403 (`MAX_PRESIGNED_EXPIRES_SECS` in `src/auth.rs`). |
+
+### 2026-11-05 — Managed Deployment Audit (1.3.0)
+
+Findings reported by the Loch.sh Panel integration audit, each reproduced by a failing regression test before the fix (`tests/integration.rs`, `test_security_*`).
+
+| Finding | Severity | Status |
+|---------|----------|--------|
+| CopyObject source not authorized for authenticated users; unsigned `x-amz-copy-source` on presigned PUT (CWE-862) | Critical | Fixed — §17 |
+| Path traversal via `uploadId` → deletion of other buckets / data directory (CWE-22) | Critical | Fixed — §18 |
+| Path traversal via `versionId` → deletion/read outside the versions directory (CWE-22) | Critical | Fixed — §19 |
+| Authorization headers, admin key and SSE-C keys in logs (CWE-532) | High | Fixed — §20 |
+| aws-chunked bodies buffered in memory (CWE-400) | Medium | Fixed — §21 |
+| No storage quota (CWE-400) | Medium | Fixed — §22 |
+| Multipart operations authorized on the URL key, not the upload's key (CWE-639) | Medium | Fixed — §23 |
+| No header-read / body idle timeouts (slowloris, stalled reservations) | Medium | Fixed — §24 (30 s headers, 60 s body idle). Total request duration and connection count are not limited: keep a reverse proxy in front for public exposure |
+| `x-amz-content-sha256` and aws-chunked trailing checksums not verified | Low | Known — integrity relies on TCP/TLS; the ETag is the MD5 of the stored payload |
+| `add_user` updates memory before persisting the users file, without rollback on write failure | Low | Known — admin API only |
 
 ---
 
@@ -360,7 +448,7 @@ All direct and transitive dependencies are free of known CVEs as of this date.
 | `subtle` | 2 | Constant-time byte comparison for signature verification |
 | `tokio-util` | 0.7 (feature `io`) | `ReaderStream` for streaming GET responses |
 | `futures-util` | 0.3 | `TryStreamExt::map_ok()` for stream frame mapping |
-| `aes-gcm` | 0.10 | AES-256-GCM authenticated encryption |
-| `hkdf` | 0.12 | HKDF-SHA256 key derivation for SSE-S3 |
-| `base64` | 0.22 | Base64 encoding/decoding for keys and nonces |
-| `rand` | 0.8 | Cryptographic random number generation (nonces, salts) |
+| `aes-gcm` | 0.11 | AES-256-GCM authenticated encryption |
+| `hkdf` | 0.13 | HKDF-SHA256 key derivation for SSE-S3 |
+| `base64` | 0.23 | Base64 encoding/decoding for keys and nonces |
+| `rand` | 0.10 | Cryptographic random number generation (nonces, salts) |

@@ -66,6 +66,8 @@ Multi-architecture images (`linux/amd64` + `linux/arm64`) are published to GitHu
 ghcr.io/loch-sh/s3
 ```
 
+The image runs as the fixed unprivileged user `10001:10001`, stores data in `/data` and ships a Docker healthcheck on `GET /_loch/health`. It works with a read-only root filesystem: see [Managed and hardened deployment](deployment.md).
+
 ### Minimal Launch (No Authentication)
 
 ```bash
@@ -142,12 +144,19 @@ All configuration is done via environment variables. No configuration file is re
 | `S3_ADMIN_API_KEY` | _(none)_ | Bearer token for the `/_loch/users` administration API |
 | `S3_UPLOAD_TTL` | `86400` | Multipart upload expiry in seconds (default: 24 hours) |
 | `S3_ENCRYPTION_KEY` | _(none)_ | Base64-encoded SSE-S3 master key (exactly 32 bytes) |
+| `S3_MAX_STORAGE_BYTES` | _(unlimited)_ | Storage quota in bytes for the whole data directory (objects, versions, pending multipart parts). Refusals: `403 QuotaExceeded` |
+| `S3_INIT_BUCKETS` | _(none)_ | Comma-separated buckets created at startup if missing, owned by the root user. Invalid name: startup fails |
+| `S3_SHUTDOWN_GRACE` | `8` | Seconds granted to in-flight requests after `SIGTERM`/`SIGINT` |
+| `S3_MAX_BLOCKING_THREADS` | `32` | Cap on the blocking thread pool used for file I/O (keep below the container PID limit) |
 
 **Notes:**
 
 - `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` must be set together or not at all.
 - `S3_ENCRYPTION_KEY` must be exactly 32 bytes (256 bits) encoded in base64. Generate with `openssl rand -base64 32`.
-- `S3_ADMIN_API_KEY` only has effect in multi-user mode (`S3_USERS_FILE`). In single-user mode (environment variables), the admin API is disabled even if the key is set.
+- `S3_ADMIN_API_KEY` only has effect in multi-user mode (`S3_USERS_FILE`). In single-user mode (environment variables), the admin API is disabled even if the key is set. Without it, the users file is never written and can be mounted read-only.
+- Invalid values (non-numeric quota, invalid bucket name in `S3_INIT_BUCKETS`, unreadable users file) make the server exit with status 1.
+
+See [Managed and hardened deployment](deployment.md) for the quota semantics, health endpoint, read-only root filesystem and shutdown behavior.
 
 ---
 

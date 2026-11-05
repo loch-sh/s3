@@ -10,6 +10,7 @@ Designed for self-hosted server-to-server use: application-level cache, shared r
 - [Usage](documentation/usage.md) — `loch-s3` CLI, Cyberduck
 - [AWS CLI](documentation/aws-cli.md) — bucket/object operations, metadata, presigned URLs, HTTP/2
 - [API reference](documentation/api.md) — S3 endpoints, admin API, bucket policies, CORS, encryption, versioning
+- [Managed deployment](documentation/deployment.md) — storage quota, health endpoint, read-only container, limits, client compatibility
 
 ## Quick start
 
@@ -35,13 +36,14 @@ aws --endpoint-url http://localhost:8080 s3 cp file.txt s3://my-bucket/file.txt
 
 - Bucket and object CRUD, copy, streaming upload
 - Object metadata (`Content-Type`, `Cache-Control`, custom `x-amz-meta-*`)
-- Object versioning, multipart upload, presigned URLs
+- Object versioning, multipart upload, presigned URLs, range requests
+- Storage quota (`S3_MAX_STORAGE_BYTES`) and health endpoint (`/_loch/health`)
 - Multi-user with bucket ownership and ARN-based bucket policies
 - User management REST API (`/_loch/users`)
 - SSE-S3 and SSE-C encryption (AES-256-GCM)
 - CORS, ACLs, bucket default encryption
 - AWS Signature V4, HTTP/2
-- Docker multi-arch image (~15 MB)
+- Docker multi-arch image (~15 MB), fixed uid `10001`, runs with a read-only root filesystem
 
 ## Known limitations
 

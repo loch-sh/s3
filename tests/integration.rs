@@ -8892,7 +8892,7 @@ async fn test_security_directory_marker_has_its_own_versions() {
         BOB,
     )
     .await;
-    assert_ne!(r.status(), 200);
+    assert_eq!(r.status(), 404, "the marker has no such version");
     let r = signed(
         &client,
         &base_url,
@@ -8904,7 +8904,7 @@ async fn test_security_directory_marker_has_its_own_versions() {
         BOB,
     )
     .await;
-    assert_ne!(r.status(), 204);
+    assert_eq!(r.status(), 404, "the marker has no such version");
     let r = signed(
         &client,
         &base_url,
@@ -9298,5 +9298,322 @@ async fn test_security_internal_names_rejected_in_any_case() {
         std::fs::read(tmp_dir.join("case-int/.metadata")).unwrap(),
         before
     );
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_security_version_specific_policy_actions() {
+    use reqwest::Method;
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    setup_alice_and_bob(&client, &base_url).await;
+    let enable = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "versioning=",
+        enable,
+        &[],
+        ALICE,
+    )
+    .await;
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b/doc",
+        "",
+        b"v1",
+        &[],
+        ALICE,
+    )
+    .await;
+    let vid = r
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let q = format!("versionId={vid}");
+
+    // Allow s3:GetObject alone still grants version reads (compatibility)
+    let allow = br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:loch:iam:::user/bob"},"Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:loch:s3:::alice-b","arn:loch:s3:::alice-b/*"]}]}"#;
+    signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "policy=",
+        allow,
+        &[],
+        ALICE,
+    )
+    .await;
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/alice-b/doc",
+        &q,
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+
+    // Deny on the version actions applies to versioned requests only
+    let deny = br#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Principal":{"AWS":"arn:loch:iam:::user/bob"},"Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:loch:s3:::alice-b","arn:loch:s3:::alice-b/*"]},
+        {"Effect":"Deny","Principal":{"AWS":"arn:loch:iam:::user/bob"},"Action":["s3:GetObjectVersion","s3:ListBucketVersions"],"Resource":["arn:loch:s3:::alice-b","arn:loch:s3:::alice-b/*"]}]}"#;
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "policy=",
+        deny,
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 204);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/alice-b/doc",
+        &q,
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_eq!(r.status(), 403);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/alice-b/doc",
+        "",
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/alice-b",
+        "versions=",
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_eq!(r.status(), 403);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/alice-b",
+        "list-type=2",
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_duplicate_user_metadata_header_is_refused() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/dup-meta"))
+        .send()
+        .await
+        .unwrap();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.append("x-amz-meta-k", "first".parse().unwrap());
+    headers.append("x-amz-meta-k", "second".parse().unwrap());
+    let r = client
+        .put(format!("{base_url}/dup-meta/o"))
+        .headers(headers)
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_quota_counts_object_acls() {
+    let (base_url, tmp_dir) = start_server_with_quota(Some(1_000_000)).await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/acl-q"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base_url}/acl-q/o"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    let before = used_bytes(&client, &base_url).await;
+    let acl = format!(
+        "<AccessControlPolicy><AccessControlList>{}</AccessControlList></AccessControlPolicy>",
+        "<Grant><Grantee><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission></Grant>".repeat(40)
+    );
+    for _ in 0..3 {
+        let r = client
+            .put(format!("{base_url}/acl-q/o?acl"))
+            .body(acl.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    // Counted once (overwrites do not accumulate)
+    let with_acl = used_bytes(&client, &base_url).await;
+    assert!(with_acl >= before + acl.len() as u64 && with_acl < before + 2 * acl.len() as u64);
+    // Oversized ACL body refused
+    let r = client
+        .put(format!("{base_url}/acl-q/o?acl"))
+        .body("x".repeat(17 * 1024))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 413);
+    client
+        .delete(format!("{base_url}/acl-q/o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(used_bytes(&client, &base_url).await, 0);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_copy_and_put_publish_nothing_on_layout_conflict() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client.put(format!("{base_url}/ccx")).send().await.unwrap();
+    client
+        .put(format!("{base_url}/ccx/k"))
+        .body("k")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base_url}/ccx/src"))
+        .body("src")
+        .send()
+        .await
+        .unwrap();
+    // Copy onto a key whose sidecar collides with k's sidecar
+    let r = client
+        .put(format!("{base_url}/ccx/k.json/x"))
+        .header("x-amz-copy-source", "/ccx/src")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = client
+        .head(format!("{base_url}/ccx/k.json/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    // Object "a/b" exists: "a" cannot be a file
+    client
+        .put(format!("{base_url}/ccx/a/b"))
+        .body("ab")
+        .send()
+        .await
+        .unwrap();
+    let r = client
+        .put(format!("{base_url}/ccx/a"))
+        .body("a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(!tmp_dir.join("ccx/.meta/a.json").exists());
+    let r = client
+        .get(format!("{base_url}/ccx/a/b"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.text().await.unwrap(), "ab");
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_list_versions_distinguishes_key_and_directory_marker() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client.put(format!("{base_url}/lvb")).send().await.unwrap();
+    client
+        .put(format!("{base_url}/lvb?versioning"))
+        .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+        .send()
+        .await
+        .unwrap();
+    // "pub" (file) and "pub/" (directory) cannot coexist on disk: use
+    // "pub" next to the marker "pubdir/"
+    let r = client
+        .put(format!("{base_url}/lvb/pub"))
+        .body("file")
+        .send()
+        .await
+        .unwrap();
+    let v_file = r
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let r = client
+        .put(format!("{base_url}/lvb/pubdir/"))
+        .body("")
+        .send()
+        .await
+        .unwrap();
+    let v_dir = r
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = client
+        .get(format!("{base_url}/lvb?versions"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(&format!("<Key>pub</Key><VersionId>{v_file}</VersionId>")),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!("<Key>pubdir/</Key><VersionId>{v_dir}</VersionId>")),
+        "{body}"
+    );
+    assert!(!body.contains(".dir_marker"), "{body}");
     cleanup(&tmp_dir);
 }

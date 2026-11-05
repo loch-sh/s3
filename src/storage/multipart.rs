@@ -238,7 +238,7 @@ impl Storage {
         if let Some(parent) = object_path.parent() {
             fs::create_dir_all(parent)
                 .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                .map_err(crate::storage::path_conflict_error)?;
         }
 
         // Only one completion at a time per upload (each assembles a full

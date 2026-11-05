@@ -1171,10 +1171,10 @@ pub async fn copy_object(
         Ok(p) => p,
         Err(e) => return error_response(e, &resource),
     };
-    if let Some(parent) = dst_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return error_response(S3Error::InternalError(e.to_string()), &resource);
-        }
+    if let Some(parent) = dst_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return error_response(crate::storage::path_conflict_error(e), &resource);
     }
 
     // Reserve quota for the copy (plaintext size; doubled when the destination keeps versions)

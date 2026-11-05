@@ -123,23 +123,40 @@ impl S3Action {
 
 /// Case-insensitive match of an IAM action pattern (`*` and `?` wildcards),
 /// as AWS does: `*`, `s3:*`, `s3:Get*`, `s3:getobject` all match `s3:GetObject`.
+/// Iterative two-pointer matcher: O(len(pattern) * len(name)) in the worst
+/// case, whatever the number of wildcards (no backtracking blow-up).
 fn action_pattern_matches(pattern: &str, name: &str) -> bool {
-    fn glob(p: &[u8], n: &[u8]) -> bool {
-        match (p.first(), n.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => glob(&p[1..], n) || (!n.is_empty() && glob(p, &n[1..])),
-            (Some(b'?'), Some(_)) => glob(&p[1..], &n[1..]),
-            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => glob(&p[1..], &n[1..]),
-            _ => false,
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
         }
     }
-    glob(pattern.as_bytes(), name.as_bytes())
+    p[pi..].iter().all(|&b| b == b'*')
 }
+
+/// Longest accepted action pattern (AWS action names are short).
+const MAX_ACTION_PATTERN_LEN: usize = 128;
 
 /// A policy action must be `*` or an `s3:` action name (wildcards allowed).
 fn is_valid_action_pattern(pattern: &str) -> bool {
     if pattern == "*" {
         return true;
+    }
+    if pattern.len() > MAX_ACTION_PATTERN_LEN {
+        return false;
     }
     let Some(name) = pattern
         .get(..3)
@@ -319,6 +336,22 @@ pub fn parse_policy(json_bytes: &[u8]) -> Result<BucketPolicy, S3Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_action_pattern_matching() {
+        for p in ["*", "s3:*", "s3:Get*", "s3:getobject", "S3:GETOBJECT", "s3:Get?bject", "s3:*Object"] {
+            assert!(action_pattern_matches(p, "s3:GetObject"), "{p}");
+        }
+        for p in ["s3:Put*", "s3:GetObjectX", "s3:Get", "iam:*", "s3:?"] {
+            assert!(!action_pattern_matches(p, "s3:GetObject"), "{p}");
+        }
+        // Pathological pattern: bounded time, no deep recursion
+        let evil = format!("s3:{}Z", "*".repeat(100_000));
+        let started = std::time::Instant::now();
+        assert!(!action_pattern_matches(&evil, "s3:GetObject"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!is_valid_action_pattern(&evil));
+    }
 
     #[test]
     fn test_parse_valid_policy() {

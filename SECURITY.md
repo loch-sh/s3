@@ -361,7 +361,7 @@ This document describes the security vulnerabilities that were identified during
 
 **Risk:** only `s3:*` and five exact action names were recognized: `"*"`, `s3:Get*` or `s3:getobject` in a Deny did nothing. Version reads, version deletions and version listings were authorized as GetObject, DeleteObject and ListBucket, so a Deny on `s3:GetObjectVersion` or `s3:DeleteObjectVersion` had no effect.
 
-**Mitigation:** actions match as on AWS (case-insensitive, `*` and `?` wildcards, `"*"` for everything); actions that are not `*` or `s3:<name>` are rejected with `MalformedPolicy`. Requests with `versionId` are evaluated as `s3:GetObjectVersion` / `s3:DeleteObjectVersion` and `?versions` as `s3:ListBucketVersions`; each also answers to its base action, so existing `Allow s3:GetObject` policies keep working while a Deny on either name applies.
+**Mitigation:** actions match as on AWS (case-insensitive, `*` and `?` wildcards, `"*"` for everything) with an iterative matcher whose cost is bounded by the pattern and name lengths (no backtracking blow-up); actions that are not `*` or `s3:<name>`, or longer than 128 characters, are rejected with `MalformedPolicy`. Requests with `versionId` are evaluated as `s3:GetObjectVersion` / `s3:DeleteObjectVersion` and `?versions` as `s3:ListBucketVersions`; each also answers to its base action, so existing `Allow s3:GetObject` policies keep working while a Deny on either name applies.
 
 **Files:** `src/policy.rs`, `src/router.rs`
 
@@ -369,7 +369,7 @@ This document describes the security vulnerabilities that were identified during
 
 **Risk:** sidecars (standard headers were uncapped) and ACL files were not counted until the next recount: a writer could store many times the quota, then lock the tenant out at the next recount.
 
-**Mitigation:** sidecars and ACLs are counted when written and released when deleted; the standard headers stored in a sidecar are capped at 8 KiB (`413 EntityTooLarge`), ACL bodies at 16 KiB; ACL writes are refused once the quota is reached.
+**Mitigation:** sidecars and ACLs are counted when written and released when deleted (ACL files are written atomically under their path lock); the standard headers stored in a sidecar are capped at 8 KiB (`413 EntityTooLarge`), ACL bodies at 16 KiB; ACL writes are refused once the quota is reached.
 
 **Files:** `src/storage/object.rs`, `src/storage/acl.rs`, `src/handlers/object.rs`, `src/router.rs`
 

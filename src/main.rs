@@ -231,6 +231,8 @@ fn load_app_config() -> Result<AppConfig, String> {
     let max_storage_bytes = parse_env_opt_u64("S3_MAX_STORAGE_BYTES")?;
     let shutdown_grace_secs = parse_env_u64("S3_SHUTDOWN_GRACE", DEFAULT_SHUTDOWN_GRACE_SECS)?;
     let init_buckets = parse_init_buckets()?;
+    // Read by the storage layer; validated here so a typo fails at startup
+    let _ = parse_env_u64("S3_MIN_UPLOAD_RATE", 4096)?;
 
     Ok(AppConfig {
         port,

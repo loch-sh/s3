@@ -12,12 +12,22 @@ impl Storage {
     /// Store a bucket-level ACL.
     pub async fn put_bucket_acl(&self, bucket: &str, acl_xml: &[u8]) -> Result<(), S3Error> {
         self.head_bucket(bucket).await?;
-        self.quota.check_not_exceeded()?;
         let path = self.data_dir.join(bucket).join(BUCKET_ACL_FILE);
-        let replaced = crate::quota::file_size(&path).await;
-        fs::write(&path, acl_xml)
+        self.write_acl_file(&path, acl_xml).await
+    }
+
+    /// Write an ACL file atomically under its path lock, counted in the quota.
+    async fn write_acl_file(&self, path: &std::path::Path, acl_xml: &[u8]) -> Result<(), S3Error> {
+        self.quota.check_not_exceeded()?;
+        let tmp_path = self.tmp_file();
+        fs::write(&tmp_path, acl_xml)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        let _path_guard = self.quota.lock_path(path).await;
+        let replaced = crate::quota::file_size(path).await;
+        crate::storage::rename_into(&tmp_path, path)
+            .await
+            .map_err(super::path_conflict_error)?;
         self.quota.add(acl_xml.len() as u64);
         self.quota.release(replaced);
         Ok(())
@@ -49,16 +59,9 @@ impl Storage {
         if let Some(parent) = acl_path.parent() {
             fs::create_dir_all(parent)
                 .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                .map_err(super::path_conflict_error)?;
         }
-        self.quota.check_not_exceeded()?;
-        let replaced = crate::quota::file_size(&acl_path).await;
-        fs::write(&acl_path, acl_xml)
-            .await
-            .map_err(super::path_conflict_error)?;
-        self.quota.add(acl_xml.len() as u64);
-        self.quota.release(replaced);
-        Ok(())
+        self.write_acl_file(&acl_path, acl_xml).await
     }
 
     /// Read an object-level ACL. Returns None if no ACL has been set.

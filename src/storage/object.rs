@@ -17,13 +17,6 @@ use crate::quota::{Reservation, file_size};
 
 const META_DIR: &str = ".meta";
 
-impl StoredMetadata {
-    /// Parse a sidecar, falling back to defaults for unreadable content.
-    pub(crate) fn from_bytes(data: &[u8]) -> Self {
-        serde_json::from_slice(data).unwrap_or_default()
-    }
-}
-
 /// Persisted object metadata (system headers + user-defined x-amz-meta-*).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct StoredMetadata {
@@ -161,6 +154,25 @@ impl Storage {
         Ok((etag, encryption))
     }
 
+    /// Atomically write raw sidecar bytes, keeping the quota balanced.
+    async fn write_sidecar_bytes(
+        &self,
+        meta_path: &std::path::Path,
+        data: &[u8],
+    ) -> Result<(), S3Error> {
+        let tmp_path = self.tmp_file();
+        fs::write(&tmp_path, data)
+            .await
+            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        let replaced = file_size(meta_path).await;
+        crate::storage::rename_into(&tmp_path, meta_path)
+            .await
+            .map_err(super::path_conflict_error)?;
+        self.quota.add(data.len() as u64);
+        self.quota.release(replaced);
+        Ok(())
+    }
+
     /// Remove the empty directories between `path` and the bucket root.
     async fn remove_empty_parents(&self, bucket: &str, path: &std::path::Path) {
         let bucket_root = self.data_dir.join(bucket);
@@ -199,14 +211,14 @@ impl Storage {
         let stored = file_size(tmp_path).await;
         let replaced = file_size(object_path).await;
         if let Err(e) = crate::storage::rename_into(tmp_path, object_path).await {
-            match previous_sidecar {
-                Some(old) => {
-                    let restored = StoredMetadata::from_bytes(&old);
-                    let _ = self.put_object_metadata(bucket, key, &restored).await;
-                }
-                None => {
-                    let _ = self.delete_object_metadata(bucket, key).await;
-                }
+            // Put back the exact previous sidecar bytes (never a re-parsed copy
+            // that could drop encryption parameters or unknown fields)
+            let restored = match previous_sidecar {
+                Some(old) => self.write_sidecar_bytes(&meta_path, &old).await,
+                None => self.delete_object_metadata(bucket, key).await,
+            };
+            if let Err(re) = restored {
+                eprintln!("Failed to restore the sidecar of {bucket}/{key}: {re:?}");
             }
             return Err(super::path_conflict_error(e));
         }
@@ -317,71 +329,6 @@ impl Storage {
         self.delete_object_acl(bucket, key).await?;
 
         Ok(())
-    }
-
-    /// Copy an object within the storage (streams file-to-file, no full buffering).
-    pub async fn copy_object(
-        &self,
-        src_bucket: &str,
-        src_key: &str,
-        dst_bucket: &str,
-        dst_key: &str,
-    ) -> Result<ObjectMetadata, S3Error> {
-        self.head_bucket(src_bucket).await?;
-        self.head_bucket(dst_bucket).await?;
-
-        let src_path = self.object_path(src_bucket, src_key)?;
-        if !is_regular_file(&src_path).await {
-            return Err(S3Error::NoSuchKey);
-        }
-
-        let dst_path = self.object_path(dst_bucket, dst_key)?;
-        if let Some(parent) = dst_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        }
-
-        // UUID-based temp file for atomic copy
-        let tmp_path = self.tmp_file();
-        fs::copy(&src_path, &tmp_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        crate::storage::rename_into(&tmp_path, &dst_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
-
-        let etag = compute_file_md5(&dst_path).await?;
-
-        let meta = fs::symlink_metadata(&dst_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
-
-        let last_modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-
-        // Copy metadata sidecar from source to destination
-        let stored = self.get_stored_metadata(src_bucket, src_key).await?;
-        self.put_object_metadata(dst_bucket, dst_key, &stored)
-            .await?;
-
-        let content_type = stored
-            .content_type
-            .clone()
-            .unwrap_or_else(|| guess_content_type(dst_key));
-
-        Ok(ObjectMetadata {
-            content_length: meta.len(),
-            last_modified,
-            etag,
-            content_type,
-            cache_control: stored.cache_control,
-            content_disposition: stored.content_disposition,
-            content_encoding: stored.content_encoding,
-            content_language: stored.content_language,
-            expires: stored.expires,
-            user_metadata: stored.user_metadata,
-            encryption: stored.encryption,
-        })
     }
 
     // -- Object metadata persistence --
@@ -687,21 +634,24 @@ pub(crate) async fn stream_body_to_file(
         decoded.clear();
         reader.feed(&data, &mut decoded)?;
         let payload: &[u8] = &decoded;
-        if payload.is_empty() {
-            continue;
-        }
-        reservation.ensure(total + payload.len() as u64)?;
         // A client trickling bytes would otherwise keep its whole up-front
         // reservation (declared size) forever, blocking every other write.
-        // Checked per 60 s window, so an early burst gives no credit.
-        window_bytes += payload.len() as u64;
-        if min_rate > 0 && window_start.elapsed() >= BODY_RATE_WINDOW {
-            if window_bytes < min_rate.saturating_mul(BODY_RATE_WINDOW.as_secs()) {
+        // Checked on every frame (including frames that only carry
+        // aws-chunked framing) per window of at least 60 s, against the time
+        // actually elapsed, so an early burst gives no credit.
+        window_bytes += data.len() as u64;
+        let window = window_start.elapsed();
+        if min_rate > 0 && window >= BODY_RATE_WINDOW {
+            if window_bytes < min_rate.saturating_mul(window.as_secs()) {
                 return Err(S3Error::RequestTimeout);
             }
             window_start = std::time::Instant::now();
             window_bytes = 0;
         }
+        if payload.is_empty() {
+            continue;
+        }
+        reservation.ensure(total + payload.len() as u64)?;
         md5_ctx.consume(payload);
         file.write_all(payload)
             .await

@@ -137,6 +137,22 @@ pub fn parse_cors_xml(xml_bytes: &[u8]) -> Result<CorsConfiguration, S3Error> {
         return Err(S3Error::MalformedXML);
     }
 
+    // Every value ends up in a response header: reject anything that is not
+    // a valid header value (control characters such as CR/LF)
+    for rule in &rules {
+        let values = rule
+            .allowed_origins
+            .iter()
+            .chain(&rule.allowed_methods)
+            .chain(&rule.allowed_headers)
+            .chain(&rule.expose_headers);
+        for v in values {
+            if hyper::header::HeaderValue::from_str(v).is_err() {
+                return Err(S3Error::MalformedXML);
+            }
+        }
+    }
+
     Ok(CorsConfiguration { rules })
 }
 

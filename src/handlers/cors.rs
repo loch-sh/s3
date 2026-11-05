@@ -15,7 +15,7 @@ pub async fn put_bucket_cors(
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
     // Limit CORS body to 64 KB
-    let body = match read_body_limited(req.into_body(), 64 * 1024).await {
+    let body = match read_body_limited(req, 64 * 1024).await {
         Ok(data) => data,
         Err(e) => return error_response(e, &format!("/{}", bucket)),
     };

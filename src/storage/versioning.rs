@@ -216,6 +216,8 @@ impl Storage {
         vid: &str,
     ) -> Result<(), S3Error> {
         validate_version_id(vid)?;
+        // A delete marker is a write: refused once the quota is reached
+        self.quota.check_not_exceeded()?;
         let ver_dir = self.versions_key_dir(bucket, key)?;
         fs::create_dir_all(&ver_dir)
             .await
@@ -244,6 +246,8 @@ impl Storage {
         fs::write(&meta_path, &meta_json)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        // Counted right away (not only at the next recount)
+        self.quota.add(meta_json.len() as u64);
 
         Ok(())
     }
@@ -533,12 +537,19 @@ impl Storage {
         .await?;
 
         for key in unversioned_keys {
+            // Filter before touching the file (the prefix filter below only
+            // applies to the collected entries)
+            if !key.starts_with(prefix) {
+                continue;
+            }
             let object_path = match self.object_path(bucket, &key) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
             if let Ok(file_meta) = fs::symlink_metadata(&object_path).await {
-                let etag = compute_file_md5(&object_path).await.unwrap_or_default();
+                let (etag, size) = self
+                    .listed_etag_and_size(bucket, &key, &object_path, file_meta.len())
+                    .await;
                 let last_modified = file_meta
                     .modified()
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -548,7 +559,7 @@ impl Storage {
                     is_delete_marker: false,
                     last_modified: format_system_time(last_modified),
                     etag,
-                    size: file_meta.len(),
+                    size,
                     is_latest: true,
                 });
             }

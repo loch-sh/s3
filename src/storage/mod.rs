@@ -154,7 +154,9 @@ pub fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
 /// Validate an object key.
 /// - 1 to 1024 bytes
 /// - No null bytes
-/// - No ".." path component (prevents path traversal)
+/// - No "..", "." or empty path component (prevents path traversal and
+///   aliasing: one key maps to exactly one path); a single trailing '/'
+///   (directory marker) is allowed
 /// - No component matching DIR_MARKER (prevents sentinel collision)
 /// - First component must not match any INTERNAL_NAMES (prevents bucket state overwrites)
 pub fn validate_object_key(key: &str) -> Result<(), S3Error> {
@@ -166,10 +168,20 @@ pub fn validate_object_key(key: &str) -> Result<(), S3Error> {
         return Err(S3Error::InvalidObjectKey);
     }
 
+    // A key ending with '/' is a directory marker: its last component is empty.
+    let body = key.strip_suffix('/').unwrap_or(key);
+    // Each component is a directory on disk: bound the nesting so a single
+    // request cannot create hundreds of directories.
+    if body.split('/').count() > MAX_KEY_DEPTH {
+        return Err(S3Error::InvalidObjectKey);
+    }
     let mut first = true;
-    for component in key.split('/') {
-        // Reject ".." to prevent path traversal
-        if component == ".." {
+    for component in body.split('/') {
+        // Reject "..", "." and empty components: the filesystem resolves
+        // "a/./b", "a//b", "./x" and "/x" to another key (possibly an
+        // internal file such as "./.policy.json"), while authorization
+        // would see the literal key. One key = one path.
+        if component.is_empty() || component == "." || component == ".." {
             return Err(S3Error::InvalidObjectKey);
         }
         // Reject DIR_MARKER to prevent collision with directory marker sentinels
@@ -246,6 +258,9 @@ pub fn guess_content_type(key: &str) -> String {
 
 /// Internal file and directory names that should be excluded from object listings
 /// and "bucket empty" checks (metadata, policies, CORS, uploads, versions, ACLs).
+/// Maximum number of `/`-separated components in an object key.
+pub const MAX_KEY_DEPTH: usize = 64;
+
 pub(crate) const INTERNAL_NAMES: &[&str] = &[
     ".metadata",
     ".meta",
@@ -289,7 +304,35 @@ mod tests {
         assert!(validate_object_key("file.txt").is_ok());
         assert!(validate_object_key("dir/nested/file.txt").is_ok());
         assert!(validate_object_key("a").is_ok());
-        assert!(validate_object_key("./file.txt").is_ok()); // single dot is ok
+        assert!(validate_object_key("dir/").is_ok()); // directory marker
+        assert!(validate_object_key("dir/sub/").is_ok());
+        assert!(validate_object_key(".hidden").is_ok());
+        assert!(validate_object_key("a/.policy.json").is_ok()); // nested: not internal
+        assert!(validate_object_key("a.b/c..d/...").is_ok()); // dots inside names
+    }
+
+    #[test]
+    fn test_non_canonical_keys_rejected() {
+        // Each of these resolves on disk to another key or to an internal
+        // file, while authorization would see the literal string.
+        for key in [
+            "./file.txt",
+            "./.policy.json",
+            "./.metadata",
+            ".//.policy.json",
+            "a/./b",
+            "a//b",
+            "a/b//",
+            "a/.",
+            "/abs",
+            "//x",
+            "/",
+            ".",
+            "./",
+            "x/./.meta/y.json",
+        ] {
+            assert!(validate_object_key(key).is_err(), "{key:?} must be rejected");
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::{
     BoxBody, empty_response, error_response, etag_response, read_body_limited, xml_response,
 };
 use crate::ServerConfig;
-use crate::encryption::{self, SseRequest};
+use crate::encryption::{self, EncryptRequest, SseRequest};
 use crate::error::S3Error;
 use crate::storage::Storage;
 use crate::storage::bucket::format_system_time;
@@ -130,6 +130,7 @@ pub async fn upload_part(
     if let Err(e) = reservation.ensure(declared) {
         return error_response(e, &resource);
     }
+    let check = super::payload_check(&req);
     let body = req.into_body();
     // Parts are stored as plaintext; encryption happens at CompleteMultipartUpload
     match storage
@@ -139,6 +140,7 @@ pub async fn upload_part(
             part_number,
             body,
             aws_chunked,
+            check,
             reservation,
         )
         .await
@@ -194,7 +196,7 @@ pub async fn complete_multipart_upload(
         };
 
     // Read the XML body listing parts (limit 10 MB)
-    let body_bytes = match read_body_limited(req.into_body(), 10 * 1024 * 1024).await {
+    let body_bytes = match read_body_limited(req, 10 * 1024 * 1024).await {
         Ok(data) => data,
         Err(e) => return error_response(e, &resource),
     };
@@ -219,75 +221,41 @@ pub async fn complete_multipart_upload(
         return error_response(e, &resource);
     }
 
+    // Encryption chosen at CreateMultipartUpload, applied before publishing
+    let encrypt = match upload_meta.sse_algorithm.as_deref() {
+        Some("AES256") => match config.encryption.as_ref() {
+            Some(c) => Some(EncryptRequest::SseS3 {
+                master_key: c.master_key,
+            }),
+            None => {
+                return error_response(
+                    S3Error::ServerSideEncryptionConfigurationNotFoundError,
+                    &resource,
+                );
+            }
+        },
+        Some("SSE-C") => sse_c_key.map(|(key, key_md5)| EncryptRequest::SseC { key, key_md5 }),
+        _ => None,
+    };
+
     match storage
-        .complete_multipart_upload(bucket, upload_id, parts)
+        .complete_multipart_upload(bucket, upload_id, parts, encrypt.as_ref())
         .await
     {
-        Ok((completed_key, etag)) => {
-            // Encrypt the assembled file if SSE was requested
-            let encryption_meta = match upload_meta.sse_algorithm.as_deref() {
-                Some("AES256") => {
-                    // SSE-S3
-                    let enc_config = match config.encryption.as_ref() {
-                        Some(c) => c,
-                        None => {
-                            return error_response(
-                                S3Error::ServerSideEncryptionConfigurationNotFoundError,
-                                &resource,
-                            );
-                        }
-                    };
-                    let object_path = match storage.object_path(bucket, &completed_key) {
-                        Ok(p) => p,
-                        Err(e) => return error_response(e, &resource),
-                    };
-                    match encryption::encrypt_sse_s3(
-                        &object_path,
-                        &storage.tmp_file(),
-                        &enc_config.master_key,
-                    )
-                    .await
-                    {
-                        Ok(meta) => Some(meta),
-                        Err(e) => return error_response(e, &resource),
-                    }
-                }
-                Some("SSE-C") => {
-                    // SSE-C
-                    let (cust_key, cust_md5) = sse_c_key.unwrap();
-                    let object_path = match storage.object_path(bucket, &completed_key) {
-                        Ok(p) => p,
-                        Err(e) => return error_response(e, &resource),
-                    };
-                    match encryption::encrypt_sse_c(
-                        &object_path,
-                        &storage.tmp_file(),
-                        &cust_key,
-                        &cust_md5,
-                    )
-                    .await
-                    {
-                        Ok(meta) => Some(meta),
-                        Err(e) => return error_response(e, &resource),
-                    }
-                }
-                _ => None,
+        Ok((completed_key, etag, encryption_meta)) => {
+            // Fresh sidecar for the new object: never inherit the encryption
+            // parameters, ETag or metadata of the object it replaces
+            let stored = crate::storage::object::StoredMetadata {
+                owner: owner.map(|s| s.to_string()),
+                etag: Some(etag.clone()),
+                encryption: encryption_meta,
+                ..Default::default()
             };
-
-            // Store ownership and encryption metadata
+            if let Err(e) = storage
+                .put_object_metadata(bucket, &completed_key, &stored)
+                .await
             {
-                let mut stored = storage
-                    .get_stored_metadata(bucket, &completed_key)
-                    .await
-                    .unwrap_or_default();
-                stored.owner = owner.map(|s| s.to_string());
-                if let Some(ref enc) = encryption_meta {
-                    stored.encryption = Some(enc.clone());
-                    stored.etag = Some(etag.clone());
-                }
-                let _ = storage
-                    .put_object_metadata(bucket, &completed_key, &stored)
-                    .await;
+                return error_response(e, &resource);
             }
 
             let result = xml::CompleteMultipartUploadResult {

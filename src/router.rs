@@ -15,7 +15,7 @@ use crate::users::UserStore;
 
 /// Route an incoming HTTP request to the appropriate S3 handler.
 pub async fn route(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     config: Arc<ServerConfig>,
 ) -> Result<Response<BoxBody>, std::convert::Infallible> {
     let method = req.method().clone();
@@ -63,6 +63,15 @@ pub async fn route(
     let has_bucket = !bucket.is_empty();
     let has_key = !key.is_empty();
 
+    // Reject non-canonical keys ("./x", "a//b", "a/./b", "..") before any
+    // authorization decision: policies, ACLs and ownership must be evaluated
+    // on the same key the storage layer uses.
+    if has_key && let Err(e) = crate::storage::validate_object_key(&key) {
+        let response = handlers::error_response(e, &path);
+        eprintln!("<-- {} {}", response.status().as_u16(), uri);
+        return Ok(response);
+    }
+
     // Detect sub-resource query parameters
     let query_params = crate::handlers::object::parse_query(&query);
     let is_policy_request = query_params.contains_key("policy");
@@ -105,6 +114,10 @@ pub async fn route(
         _ => None,
     };
     let caller_is_root: bool = matches!(&auth_result, Ok(Some(user)) if user.is_root);
+    // Body readers enforce the signed payload hash / chunk signatures
+    if let Ok(Some(user)) = &auth_result {
+        req.extensions_mut().insert(user.payload.clone());
+    }
     if let Some(deny) = check_auth(
         &auth_result,
         &config,
@@ -486,9 +499,7 @@ async fn check_auth(
             // For data endpoints, check bucket policy and ACLs for anonymous access
             let action = determine_action(method, has_key);
             let allowed = if let Some(action) = action {
-                let policy_ok = check_anonymous_access(storage, bucket, key, action).await;
-                let acl_ok = check_acl_anonymous(storage, bucket, key, has_key, method).await;
-                policy_ok || acl_ok
+                anonymous_allowed(storage, bucket, key, has_key, method, action).await
             } else {
                 false
             };
@@ -560,11 +571,16 @@ async fn authorize_copy_source(
         // Anonymous request whose destination PUT was allowed by policy/ACL:
         // the source must allow anonymous GET too.
         Err(_) => {
-            let policy_ok =
-                check_anonymous_access(storage, &src_bucket, &src_key, S3Action::GetObject).await;
-            let acl_ok =
-                check_acl_anonymous(storage, &src_bucket, &src_key, true, &Method::GET).await;
-            if policy_ok || acl_ok { None } else { deny() }
+            let allowed = anonymous_allowed(
+                storage,
+                &src_bucket,
+                &src_key,
+                true,
+                &Method::GET,
+                S3Action::GetObject,
+            )
+            .await;
+            if allowed { None } else { deny() }
         }
     }
 }
@@ -701,20 +717,35 @@ fn determine_action(method: &Method, has_key: bool) -> Option<S3Action> {
 }
 
 /// Check if the bucket policy allows anonymous access for the given action.
+/// Anonymous access: an explicit policy Deny always wins; otherwise a policy
+/// Allow or an ACL grant allows the request.
+async fn anonymous_allowed(
+    storage: &Storage,
+    bucket: &str,
+    key: &str,
+    has_key: bool,
+    method: &Method,
+    action: S3Action,
+) -> bool {
+    match check_anonymous_access(storage, bucket, key, action).await {
+        Some(decision) => decision,
+        None => check_acl_anonymous(storage, bucket, key, has_key, method).await,
+    }
+}
+
+/// Policy decision for an anonymous request (see `BucketPolicy::anonymous_decision`).
+/// A policy file that exists but cannot be parsed denies (fail closed).
 async fn check_anonymous_access(
     storage: &Storage,
     bucket: &str,
     key: &str,
     action: S3Action,
-) -> bool {
-    let policy_data = match storage.get_bucket_policy(bucket).await {
-        Ok(data) => data,
-        Err(_) => return false,
-    };
+) -> Option<bool> {
+    let policy_data = storage.get_bucket_policy(bucket).await.ok()?;
 
     let policy: crate::policy::BucketPolicy = match serde_json::from_slice(&policy_data) {
         Ok(p) => p,
-        Err(_) => return false,
+        Err(_) => return Some(false),
     };
 
     // Build the ARN-style resource string
@@ -724,7 +755,7 @@ async fn check_anonymous_access(
         format!("arn:loch:s3:::{}/{}", bucket, key)
     };
 
-    policy.is_allowed_for_anonymous(action, &resource)
+    policy.anonymous_decision(action, &resource)
 }
 
 const ALL_USERS_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
@@ -888,7 +919,10 @@ async fn handle_preflight(
                 builder = builder.header("Access-Control-Max-Age", max_age.to_string());
             }
 
-            builder.body(full_body(bytes::Bytes::new())).unwrap()
+            // A stored rule with an invalid header value must not panic
+            builder
+                .body(full_body(bytes::Bytes::new()))
+                .unwrap_or_else(|_| empty_response(StatusCode::FORBIDDEN))
         }
         None => empty_response(StatusCode::FORBIDDEN),
     }
@@ -965,7 +999,7 @@ async fn resolve_acl_put(
     if let Some(canned) = canned_acl {
         Ok(canned_acl_xml(&canned))
     } else {
-        match read_body_limited(req.into_body(), 64 * 1024).await {
+        match read_body_limited(req, 64 * 1024).await {
             Ok(body) if !body.is_empty() => Ok(String::from_utf8_lossy(&body).to_string()),
             Ok(_) => Ok(default_acl_xml()),
             Err(e) => Err(handlers::error_response(e, resource)),

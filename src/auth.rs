@@ -24,6 +24,105 @@ pub struct AuthenticatedUser {
     pub user_id: String,
     pub display_name: String,
     pub is_root: bool,
+    /// How the request body must be verified against the signature.
+    pub payload: PayloadCheck,
+}
+
+/// Body integrity check required by the signature (`x-amz-content-sha256`).
+/// The router stores it in the request extensions; body readers enforce it.
+#[derive(Clone, Debug, Default)]
+pub enum PayloadCheck {
+    /// `UNSIGNED-PAYLOAD`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, presigned
+    /// URLs, or no authentication: nothing to verify.
+    #[default]
+    None,
+    /// The body must hash (SHA-256, lowercase hex) to this value.
+    Sha256(String),
+    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`: every aws-chunked
+    /// chunk carries a signature chained from the request signature.
+    ChunkSignatures(ChunkSigner),
+}
+
+/// Verifies the chained signatures of an aws-chunked body.
+#[derive(Clone)]
+pub struct ChunkSigner {
+    signing_key: Vec<u8>,
+    amz_date: String,
+    scope: String,
+    previous: String,
+}
+
+impl std::fmt::Debug for ChunkSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the signing key
+        f.debug_struct("ChunkSigner").finish_non_exhaustive()
+    }
+}
+
+/// SHA-256 of the empty string, part of every chunk string-to-sign.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+impl ChunkSigner {
+    /// Check the signature of the next chunk, given the SHA-256 (hex) of its
+    /// data. On success the chain advances to this chunk.
+    pub fn verify_next(&mut self, chunk_sha256_hex: &str, signature: &str) -> bool {
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+            self.amz_date, self.scope, self.previous, EMPTY_SHA256, chunk_sha256_hex
+        );
+        let expected = hmac_sha256_hex(&self.signing_key, string_to_sign.as_bytes());
+        if verify_signature(&expected, signature).is_ok() {
+            self.previous = expected;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Map the signed `x-amz-content-sha256` value to the body check to apply.
+fn payload_check_for(
+    payload_hash: &str,
+    signing_key: &[u8],
+    amz_date: &str,
+    scope: &str,
+    seed_signature: &str,
+) -> Result<PayloadCheck, S3Error> {
+    match payload_hash {
+        "UNSIGNED-PAYLOAD" | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => Ok(PayloadCheck::None),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
+            Ok(PayloadCheck::ChunkSignatures(ChunkSigner {
+                signing_key: signing_key.to_vec(),
+                amz_date: amz_date.to_string(),
+                scope: scope.to_string(),
+                previous: seed_signature.to_ascii_lowercase(),
+            }))
+        }
+        h if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Ok(PayloadCheck::Sha256(h.to_ascii_lowercase()))
+        }
+        // SigV4a (ECDSA) streaming and unknown values cannot be verified
+        _ => Err(S3Error::InvalidArgument(
+            "Unsupported x-amz-content-sha256 value.".to_string(),
+        )),
+    }
+}
+
+/// Header auth: `host` and every `x-amz-*` header sent must be signed,
+/// otherwise a captured signature could be replayed with added headers
+/// (metadata, ACL, SSE, content type...).
+fn check_signed_headers(req: &Request<Incoming>, signed: &[&str]) -> Result<(), S3Error> {
+    let is_signed = |name: &str| signed.iter().any(|s| s.eq_ignore_ascii_case(name));
+    if !is_signed("host") {
+        return Err(S3Error::AccessDenied);
+    }
+    for name in req.headers().keys() {
+        let name = name.as_str();
+        if name.starts_with("x-amz-") && !is_signed(name) {
+            return Err(S3Error::AccessDenied);
+        }
+    }
+    Ok(())
 }
 
 /// Returns true if the request uses presigned URL (query-string) authentication.
@@ -116,6 +215,8 @@ fn verify_header_auth(
     let region = scope_parts[1];
     let service = scope_parts[2];
 
+    check_signed_headers(req, &parsed.signed_headers)?;
+
     let canonical_query = canonical_query_string(req.uri().query().unwrap_or(""), None);
     let canonical_req =
         build_canonical_request(req, &parsed.signed_headers, &canonical_query, payload_hash);
@@ -131,10 +232,19 @@ fn verify_header_auth(
 
     verify_signature(&expected, parsed.signature)?;
 
+    let payload = payload_check_for(
+        payload_hash,
+        &signing_key,
+        &amz_date,
+        parsed.scope,
+        parsed.signature,
+    )?;
+
     Ok(Some(AuthenticatedUser {
         user_id: user.user_id.clone(),
         display_name: user.display_name.clone(),
         is_root: user.is_root,
+        payload,
     }))
 }
 
@@ -200,6 +310,12 @@ fn verify_presigned(
     // Canonical query: all params sorted, excluding X-Amz-Signature
     let canonical_query = canonical_query_string(query, Some("X-Amz-Signature"));
     let signed_headers: Vec<&str> = signed_headers_param.split(';').collect();
+    if !signed_headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("host"))
+    {
+        return Err(S3Error::AccessDenied);
+    }
     let canonical_req =
         build_canonical_request(req, &signed_headers, &canonical_query, "UNSIGNED-PAYLOAD");
     let canonical_req_hash = sha256_hex(canonical_req.as_bytes());
@@ -218,6 +334,7 @@ fn verify_presigned(
         user_id: user.user_id.clone(),
         display_name: user.display_name.clone(),
         is_root: user.is_root,
+        payload: PayloadCheck::None,
     }))
 }
 

@@ -16,7 +16,7 @@ pub async fn put_bucket_encryption(
 ) -> Response<BoxBody> {
     let resource = format!("/{}", bucket);
 
-    let body = match read_body_limited(req.into_body(), 64 * 1024).await {
+    let body = match read_body_limited(req, 64 * 1024).await {
         Ok(data) => data,
         Err(e) => return error_response(e, &resource),
     };

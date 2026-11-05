@@ -5,10 +5,12 @@ use std::time::SystemTime;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{INTERNAL_NAMES, Storage, guess_content_type, is_regular_file};
+use crate::auth::PayloadCheck;
 use crate::encryption::EncryptionMeta;
 use crate::error::S3Error;
 use crate::quota::{Reservation, file_size};
@@ -89,8 +91,10 @@ impl Storage {
         key: &str,
         body: Incoming,
         aws_chunked: bool,
+        check: PayloadCheck,
+        encrypt: Option<&crate::encryption::EncryptRequest>,
         mut reservation: Reservation,
-    ) -> Result<String, S3Error> {
+    ) -> Result<(String, Option<EncryptionMeta>), S3Error> {
         self.head_bucket(bucket).await?;
 
         let object_path = self.object_path(bucket, key)?;
@@ -106,16 +110,42 @@ impl Storage {
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
-        let (etag, written) =
-            match stream_body_to_file(&mut file, body, aws_chunked, &mut reservation).await {
-                Ok(r) => r,
+        let (etag, written) = match stream_body_to_file(
+            &mut file,
+            body,
+            aws_chunked,
+            check,
+            &mut reservation,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                drop(file);
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(e);
+            }
+        };
+        drop(file);
+
+        // Encrypt while the file is still a private temporary: plaintext is
+        // never published under the object path, even on crash or error.
+        let encryption = match encrypt {
+            Some(req) => match req.apply(&tmp_path, &self.tmp_file()).await {
+                Ok(meta) => Some(meta),
                 Err(e) => {
-                    drop(file);
                     let _ = fs::remove_file(&tmp_path).await;
                     return Err(e);
                 }
-            };
-        drop(file);
+            },
+            None => None,
+        };
+        // Ciphertext is slightly larger than the payload (GCM tags)
+        let stored = if encryption.is_some() {
+            file_size(&tmp_path).await
+        } else {
+            written
+        };
 
         {
             let _path_guard = self.quota.lock_path(&object_path).await;
@@ -124,11 +154,11 @@ impl Storage {
                 let _ = fs::remove_file(&tmp_path).await;
                 return Err(S3Error::InternalError(e.to_string()));
             }
-            reservation.commit(written);
+            reservation.commit(stored);
             self.quota.release(replaced);
         }
 
-        Ok(etag)
+        Ok((etag, encryption))
     }
 
     /// Get object metadata and file path for streaming by the handler.
@@ -334,6 +364,31 @@ impl Storage {
     }
 
     /// Read object metadata from disk. Returns Default if no metadata file exists.
+    /// ETag and size reported by listings: taken from the sidecar when known
+    /// (no full read of the object; plaintext size and ETag for encrypted
+    /// objects), computed only for objects written before ETags were stored.
+    pub(crate) async fn listed_etag_and_size(
+        &self,
+        bucket: &str,
+        key: &str,
+        path: &std::path::Path,
+        file_len: u64,
+    ) -> (String, u64) {
+        let stored = self
+            .get_stored_metadata(bucket, key)
+            .await
+            .unwrap_or_default();
+        let size = stored
+            .encryption
+            .as_ref()
+            .map_or(file_len, |e| e.plaintext_size);
+        let etag = match stored.etag {
+            Some(etag) => etag,
+            None => compute_file_md5(path).await.unwrap_or_default(),
+        };
+        (etag, size)
+    }
+
     pub async fn get_stored_metadata(
         &self,
         bucket: &str,
@@ -410,7 +465,7 @@ impl Storage {
                 // Check if key has delimiter after prefix
                 let after_prefix = &key[prefix.len()..];
                 if let Some(pos) = after_prefix.find(delimiter) {
-                    let cp = format!("{}{}", prefix, &after_prefix[..=pos]);
+                    let cp = format!("{}{}", prefix, &after_prefix[..pos + delimiter.len()]);
                     common_prefixes.insert(cp);
                     continue;
                 }
@@ -436,11 +491,13 @@ impl Storage {
             };
             if let Ok(meta) = fs::symlink_metadata(&object_path).await {
                 if meta.is_file() && !meta.file_type().is_symlink() {
-                    let etag = compute_file_md5(&object_path).await.unwrap_or_default();
+                    let (etag, size) = self
+                        .listed_etag_and_size(bucket, key, &object_path, meta.len())
+                        .await;
                     result_objects.push(ObjectInfo {
                         key: key.clone(),
                         last_modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                        size: meta.len(),
+                        size,
                         etag,
                     });
                     count += 1;
@@ -542,12 +599,14 @@ pub(crate) async fn stream_body_to_file(
     file: &mut tokio::fs::File,
     mut body: Incoming,
     aws_chunked: bool,
+    check: PayloadCheck,
     reservation: &mut Reservation,
 ) -> Result<(String, u64), S3Error> {
     let mut md5_ctx = md5::Context::new();
-    let mut decoder = aws_chunked.then(AwsChunkedDecoder::new);
+    let mut reader = BodyReader::new(aws_chunked, check);
     let mut decoded = Vec::new();
     let mut total: u64 = 0;
+    let started = std::time::Instant::now();
 
     loop {
         // A client that stops sending must not hold its quota reservation forever
@@ -560,18 +619,24 @@ pub(crate) async fn stream_body_to_file(
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        let payload: &[u8] = match decoder.as_mut() {
-            Some(dec) => {
-                decoded.clear();
-                dec.feed(&data, &mut decoded)?;
-                &decoded
-            }
-            None => &data,
-        };
+        decoded.clear();
+        reader.feed(&data, &mut decoded)?;
+        let payload: &[u8] = &decoded;
         if payload.is_empty() {
             continue;
         }
         reservation.ensure(total + payload.len() as u64)?;
+        // A client trickling bytes would otherwise keep its whole up-front
+        // reservation (declared size) forever, blocking every other write
+        let elapsed = started.elapsed();
+        if elapsed > BODY_RATE_GRACE
+            && total
+                < elapsed
+                    .as_secs()
+                    .saturating_mul(BODY_MIN_RATE_BYTES_PER_SEC)
+        {
+            return Err(S3Error::RequestTimeout);
+        }
         md5_ctx.consume(payload);
         file.write_all(payload)
             .await
@@ -579,13 +644,7 @@ pub(crate) async fn stream_body_to_file(
         total += payload.len() as u64;
     }
 
-    if let Some(dec) = decoder {
-        if !dec.is_complete() {
-            return Err(S3Error::InvalidArgument(
-                "Incomplete aws-chunked body (missing final chunk).".to_string(),
-            ));
-        }
-    }
+    reader.finish()?;
 
     file.flush()
         .await
@@ -593,6 +652,75 @@ pub(crate) async fn stream_body_to_file(
 
     Ok((format!("\"{:x}\"", md5_ctx.finalize()), total))
 }
+
+/// Decodes a request body (aws-chunked or raw) and enforces the integrity
+/// check required by its signature (`PayloadCheck`). Callers must discard
+/// everything they wrote if `feed` or `finish` fails.
+pub(crate) struct BodyReader {
+    decoder: Option<AwsChunkedDecoder>,
+    sha256: Option<(Sha256, String)>,
+}
+
+impl BodyReader {
+    pub(crate) fn new(aws_chunked: bool, check: PayloadCheck) -> Self {
+        match check {
+            PayloadCheck::None => Self {
+                decoder: aws_chunked.then(AwsChunkedDecoder::new),
+                sha256: None,
+            },
+            // The hash covers the body as sent (before aws-chunked decoding)
+            PayloadCheck::Sha256(expected) => Self {
+                decoder: aws_chunked.then(AwsChunkedDecoder::new),
+                sha256: Some((Sha256::new(), expected)),
+            },
+            // Signed chunks are aws-chunked by definition
+            PayloadCheck::ChunkSignatures(signer) => Self {
+                decoder: Some(AwsChunkedDecoder::with_signer(Some(signer))),
+                sha256: None,
+            },
+        }
+    }
+
+    /// Feed raw body bytes; decoded payload bytes are appended to `out`.
+    pub(crate) fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), S3Error> {
+        if let Some((hasher, _)) = self.sha256.as_mut() {
+            hasher.update(data);
+        }
+        match self.decoder.as_mut() {
+            Some(dec) => dec.feed(data, out),
+            None => {
+                out.extend_from_slice(data);
+                Ok(())
+            }
+        }
+    }
+
+    /// Check completeness and the payload hash once the body has ended.
+    pub(crate) fn finish(self) -> Result<(), S3Error> {
+        if let Some(dec) = self.decoder
+            && !dec.is_complete()
+        {
+            return Err(S3Error::InvalidArgument(
+                "Incomplete aws-chunked body (missing final chunk).".to_string(),
+            ));
+        }
+        if let Some((hasher, expected)) = self.sha256
+            && hex_lower(&hasher.finalize()) != expected
+        {
+            return Err(S3Error::XAmzContentSHA256Mismatch);
+        }
+        Ok(())
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Uploads slower than `BODY_MIN_RATE_BYTES_PER_SEC` on average are aborted
+/// once `BODY_RATE_GRACE` has elapsed.
+const BODY_RATE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+const BODY_MIN_RATE_BYTES_PER_SEC: u64 = 16 * 1024;
 
 /// Maximum time without receiving any body data before an upload is aborted.
 const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -616,14 +744,36 @@ enum ChunkState {
 struct AwsChunkedDecoder {
     state: ChunkState,
     header: Vec<u8>,
+    /// Set for STREAMING-AWS4-HMAC-SHA256-PAYLOAD: every chunk signature is verified.
+    signer: Option<crate::auth::ChunkSigner>,
+    chunk_signature: String,
+    chunk_hash: Sha256,
 }
 
 impl AwsChunkedDecoder {
     fn new() -> Self {
+        Self::with_signer(None)
+    }
+
+    fn with_signer(signer: Option<crate::auth::ChunkSigner>) -> Self {
         Self {
             state: ChunkState::Header,
             header: Vec::new(),
+            signer,
+            chunk_signature: String::new(),
+            chunk_hash: Sha256::new(),
         }
+    }
+
+    /// Verify the signature of the chunk that just ended (no-op without signer).
+    fn verify_chunk(&mut self) -> Result<(), S3Error> {
+        let digest = std::mem::replace(&mut self.chunk_hash, Sha256::new()).finalize();
+        if let Some(signer) = self.signer.as_mut()
+            && !signer.verify_next(&hex_lower(&digest), &self.chunk_signature)
+        {
+            return Err(S3Error::SignatureDoesNotMatch);
+        }
+        Ok(())
     }
 
     /// True once the final zero-size chunk has been read.
@@ -651,10 +801,19 @@ impl AwsChunkedDecoder {
                     }
                     let line = std::str::from_utf8(&self.header).map_err(|_| malformed())?;
                     let line = line.strip_suffix('\r').unwrap_or(line);
-                    let size_str = line.split(';').next().unwrap_or("").trim();
+                    let mut parts = line.split(';');
+                    let size_str = parts.next().unwrap_or("").trim();
                     let size = u64::from_str_radix(size_str, 16).map_err(|_| malformed())?;
+                    if self.signer.is_some() {
+                        self.chunk_signature = parts
+                            .find_map(|p| p.trim().strip_prefix("chunk-signature="))
+                            .ok_or(S3Error::SignatureDoesNotMatch)?
+                            .to_string();
+                    }
                     self.header.clear();
                     self.state = if size == 0 {
+                        // The final empty chunk is signed too
+                        self.verify_chunk()?;
                         ChunkState::Done
                     } else {
                         ChunkState::Data(size)
@@ -662,9 +821,13 @@ impl AwsChunkedDecoder {
                 }
                 ChunkState::Data(remaining) => {
                     let n = remaining.min(input.len() as u64) as usize;
+                    if self.signer.is_some() {
+                        self.chunk_hash.update(&input[..n]);
+                    }
                     out.extend_from_slice(&input[..n]);
                     input = &input[n..];
                     self.state = if remaining == n as u64 {
+                        self.verify_chunk()?;
                         ChunkState::DataEnd(2)
                     } else {
                         ChunkState::Data(remaining - n as u64)

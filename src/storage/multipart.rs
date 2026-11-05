@@ -41,6 +41,9 @@ pub struct UploadInfo {
 
 const UPLOADS_DIR: &str = ".uploads";
 const META_FILE: &str = ".meta.json";
+/// Created atomically by CompleteMultipartUpload: one completion at a time
+/// per upload (each one assembles a full-size temporary copy).
+const COMPLETING_FILE: &str = ".completing";
 
 /// An upload ID is valid only in the canonical hyphenated lowercase UUID form.
 pub(crate) fn is_valid_upload_id(upload_id: &str) -> bool {
@@ -142,6 +145,7 @@ impl Storage {
         part_number: u32,
         body: Incoming,
         aws_chunked: bool,
+        check: crate::auth::PayloadCheck,
         mut reservation: Reservation,
     ) -> Result<String, S3Error> {
         self.head_bucket(bucket).await?;
@@ -162,6 +166,7 @@ impl Storage {
             &mut file,
             body,
             aws_chunked,
+            check,
             &mut reservation,
         )
         .await
@@ -202,7 +207,8 @@ impl Storage {
         bucket: &str,
         upload_id: &str,
         parts: Vec<(u32, String)>,
-    ) -> Result<(String, String), S3Error> {
+        encrypt: Option<&crate::encryption::EncryptRequest>,
+    ) -> Result<(String, String, Option<crate::encryption::EncryptionMeta>), S3Error> {
         self.head_bucket(bucket).await?;
 
         let upload_dir = self.upload_path(bucket, upload_id)?;
@@ -217,6 +223,10 @@ impl Storage {
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
         let meta: UploadMeta = serde_json::from_slice(&meta_bytes)
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
+
+        if parts.is_empty() {
+            return Err(S3Error::MalformedXML);
+        }
 
         // Validate part ordering
         for i in 1..parts.len() {
@@ -233,6 +243,42 @@ impl Storage {
                 .map_err(|e| S3Error::InternalError(e.to_string()))?;
         }
 
+        // Only one completion at a time per upload; the marker disappears
+        // with the upload directory on success and is removed on failure.
+        let completing = upload_dir.join(COMPLETING_FILE);
+        if fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&completing)
+            .await
+            .is_err()
+        {
+            return Err(S3Error::NoSuchUpload);
+        }
+        let result = self
+            .assemble_upload(bucket, upload_id, &object_path, parts, encrypt)
+            .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&completing).await;
+        }
+        let (composite_etag, encryption) = result?;
+
+        // Clean up upload directory
+        let _ = self.remove_upload_dir(&upload_dir).await;
+
+        Ok((meta.key, composite_etag, encryption))
+    }
+
+    /// Assemble the parts into the object (encrypted if requested) and
+    /// publish it. Returns the composite ETag and the encryption parameters.
+    async fn assemble_upload(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        object_path: &std::path::Path,
+        parts: Vec<(u32, String)>,
+        encrypt: Option<&crate::encryption::EncryptRequest>,
+    ) -> Result<(String, Option<crate::encryption::EncryptionMeta>), S3Error> {
         // Temporary file for atomic assembly
         let tmp_path = self.tmp_file();
         let mut dst_file = tokio::fs::File::create(&tmp_path)
@@ -292,13 +338,25 @@ impl Storage {
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
         drop(dst_file);
 
+        // Encrypt the assembled object before it is published
+        let encryption = match encrypt {
+            Some(req) => match req.apply(&tmp_path, &self.tmp_file()).await {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp_path).await;
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+
         // Atomic rename. Parts are already counted in the quota, so assembling
         // them is space-neutral once the upload directory is removed below.
         {
-            let _path_guard = self.quota.lock_path(&object_path).await;
+            let _path_guard = self.quota.lock_path(object_path).await;
             let assembled = file_size(&tmp_path).await;
-            let replaced = file_size(&object_path).await;
-            if let Err(e) = crate::storage::rename_into(&tmp_path, &object_path).await {
+            let replaced = file_size(object_path).await;
+            if let Err(e) = crate::storage::rename_into(&tmp_path, object_path).await {
                 let _ = fs::remove_file(&tmp_path).await;
                 return Err(S3Error::InternalError(e.to_string()));
             }
@@ -309,10 +367,7 @@ impl Storage {
         // S3-style multipart ETag: md5_of_concatenated_part_md5s-part_count
         let composite_etag = format!("\"{:x}-{}\"", md5_of_md5s.finalize(), part_count);
 
-        // Clean up upload directory
-        let _ = self.remove_upload_dir(&upload_dir).await;
-
-        Ok((meta.key, composite_etag))
+        Ok((composite_etag, encryption))
     }
 
     /// Abort a multipart upload (delete all parts and metadata).
@@ -380,7 +435,7 @@ impl Storage {
             .map_err(|e| S3Error::InternalError(e.to_string()))?
         {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == META_FILE || name.ends_with("tmp") {
+            if name == META_FILE || name == COMPLETING_FILE || name.ends_with("tmp") {
                 continue;
             }
             if let Ok(part_number) = name.parse::<u32>() {

@@ -8098,3 +8098,727 @@ fn test_encryption_key_file_loading_and_refusals() {
 
     cleanup(&tmp);
 }
+
+// ---------------------------------------------------------------------------
+// 1.4.1: non-canonical object keys (dot segments, empty segments)
+// ---------------------------------------------------------------------------
+
+/// Send a raw HTTP/1.1 request with the path exactly as given (reqwest would
+/// normalize "./" segments). Returns the status code.
+async fn raw_request(base_url: &str, method: &str, path: &str, body: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = base_url.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    text.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn test_security_dot_segment_keys_cannot_reach_internal_files() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/dotseg"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base_url}/dotseg/secret/x"))
+        .body("TOPSECRET")
+        .send()
+        .await
+        .unwrap();
+    let metadata_before = std::fs::read(tmp_dir.join("dotseg/.metadata")).unwrap();
+    let forged = r#"{"created":"2026-01-01T00:00:00.000Z","owner":"mallory"}"#;
+
+    for path in [
+        "/dotseg/./.metadata",
+        "/dotseg/%2e/.metadata",
+        "/dotseg/.//.metadata",
+        "/dotseg//.metadata",
+        "/dotseg/./.policy.json",
+        "/dotseg/%2E/.policy.json",
+        "/dotseg/./.meta/secret/x.json",
+        "/dotseg/a/./b",
+        "/dotseg/a//b",
+    ] {
+        for method in ["PUT", "GET", "DELETE"] {
+            let status = raw_request(&base_url, method, path, forged).await;
+            assert!(
+                status == 400 || status == 403,
+                "{method} {path} returned {status}"
+            );
+        }
+    }
+    // Reading through a dot segment is refused too (Deny bypass vector)
+    assert_eq!(
+        raw_request(&base_url, "GET", "/dotseg/./secret/x", "").await,
+        400
+    );
+
+    // Internal state untouched, no policy planted, no aliased object created
+    assert_eq!(
+        std::fs::read(tmp_dir.join("dotseg/.metadata")).unwrap(),
+        metadata_before
+    );
+    assert!(!tmp_dir.join("dotseg/.policy.json").exists());
+    assert!(!tmp_dir.join("dotseg/a").exists());
+    // The legitimate object is still there
+    let resp = client
+        .get(format!("{base_url}/dotseg/secret/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "TOPSECRET");
+
+    cleanup(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 1.4.1: signed payload integrity (x-amz-content-sha256, chunk signatures)
+// ---------------------------------------------------------------------------
+
+/// Build a STREAMING-AWS4-HMAC-SHA256-PAYLOAD PUT: returns the request
+/// headers and the aws-chunked body. `tamper` alters the data of the first
+/// chunk after it has been signed.
+fn streaming_signed_put(
+    host: &str,
+    path: &str,
+    chunks: &[&[u8]],
+    keys: (&str, &str),
+    tamper: bool,
+) -> (Vec<(String, String)>, Vec<u8>) {
+    let now = chrono::Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date_stamp = now.format("%Y%m%d").to_string();
+    let scope = format!("{date_stamp}/loch-sh/s3/aws4_request");
+    let decoded_len: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut headers = vec![
+        ("content-encoding".to_string(), "aws-chunked".to_string()),
+        ("host".to_string(), host.to_string()),
+        (
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
+        ),
+        ("x-amz-date".to_string(), amz_date.clone()),
+        (
+            "x-amz-decoded-content-length".to_string(),
+            decoded_len.to_string(),
+        ),
+    ];
+    headers.sort();
+    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let signed_headers = headers
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_request = format!(
+        "PUT\n{path}\n\n{canonical_headers}\n{signed_headers}\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = derive_signing_key(keys.1, &date_stamp, "loch-sh", "s3");
+    let seed = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
+
+    let empty = sha256_hex(b"");
+    let mut previous = seed.clone();
+    let mut body = Vec::new();
+    let mut all: Vec<&[u8]> = chunks.to_vec();
+    all.push(b"");
+    for (i, chunk) in all.iter().enumerate() {
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{previous}\n{empty}\n{}",
+            sha256_hex(chunk)
+        );
+        let sig = hmac_sha256_hex(&signing_key, sts.as_bytes());
+        body.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", chunk.len()).as_bytes());
+        let mut data = chunk.to_vec();
+        if tamper && i == 0 {
+            data[0] ^= 0xff;
+        }
+        body.extend_from_slice(&data);
+        body.extend_from_slice(b"\r\n");
+        previous = sig;
+    }
+    headers.push((
+        "authorization".to_string(),
+        format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={seed}",
+            keys.0
+        ),
+    ));
+    (headers, body)
+}
+
+#[tokio::test]
+async fn test_security_signed_payload_integrity_is_verified() {
+    use reqwest::Method;
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    let host = base_url.trim_start_matches("http://").to_string();
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/integ-b",
+        "",
+        b"",
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+
+    // 1. Body replaced after signing: x-amz-content-sha256 no longer matches
+    let resp = sign_request_with_headers(
+        client
+            .put(format!("{base_url}/integ-b/tampered.txt"))
+            .body("EVIL"),
+        "PUT",
+        "/integ-b/tampered.txt",
+        "",
+        &host,
+        b"hello",
+        &[],
+        ALICE.0,
+        ALICE.1,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("XAmzContentSHA256Mismatch")
+    );
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/integ-b/tampered.txt",
+        "",
+        b"",
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 404, "tampered body must not be stored");
+
+    // Same for a small XML/JSON body (bucket policy)
+    let policy = br#"{"Version":"2012-10-17","Statement":[]}"#;
+    let resp = sign_request_with_headers(
+        client
+            .put(format!("{base_url}/integ-b?policy"))
+            .body(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::integ-b/*"}]}"#),
+        "PUT",
+        "/integ-b",
+        "policy=",
+        &host,
+        policy,
+        &[],
+        ALICE.0,
+        ALICE.1,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(!tmp_dir.join("integ-b/.policy.json").exists());
+
+    // 2. x-amz-* header added after signing
+    let resp = sign_request_with_headers(
+        client
+            .put(format!("{base_url}/integ-b/meta.txt"))
+            .body("hello")
+            .header("x-amz-meta-injected", "1"),
+        "PUT",
+        "/integ-b/meta.txt",
+        "",
+        &host,
+        b"hello",
+        &[],
+        ALICE.0,
+        ALICE.1,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // 3. Signed aws-chunked upload: accepted when every chunk signature is valid
+    let (c1, c2) = (vec![b'a'; 70_000], vec![b'b'; 1234]);
+    let send = |headers: Vec<(String, String)>, body: Vec<u8>, path: &str| {
+        let mut b = client.put(format!("{base_url}{path}")).body(body);
+        for (k, v) in headers {
+            if k != "host" {
+                b = b.header(k, v);
+            }
+        }
+        b.send()
+    };
+    let (h, body) = streaming_signed_put(&host, "/integ-b/stream.bin", &[&c1, &c2], ALICE, false);
+    let resp = send(h, body, "/integ-b/stream.bin").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/integ-b/stream.bin",
+        "",
+        b"",
+        &[],
+        ALICE,
+    )
+    .await;
+    let got = r.bytes().await.unwrap();
+    assert_eq!(got.len(), c1.len() + c2.len());
+    assert!(got[..c1.len()].iter().all(|&b| b == b'a'));
+
+    // ... and rejected when a chunk was modified after signing
+    let (h, body) = streaming_signed_put(&host, "/integ-b/stream2.bin", &[&c1, &c2], ALICE, true);
+    let resp = send(h, body, "/integ-b/stream2.bin").await.unwrap();
+    assert_eq!(resp.status(), 403);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/integ-b/stream2.bin",
+        "",
+        b"",
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        404,
+        "object with a forged chunk must not be stored"
+    );
+
+    cleanup(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 1.4.1: authorization, quota and robustness fixes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_security_policy_deny_wins_over_public_acl() {
+    use reqwest::Method;
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    setup_alice_and_bob(&client, &base_url).await;
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b/public.txt",
+        "",
+        b"P",
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "acl=",
+        b"",
+        &[("x-amz-acl", "public-read")],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    // Public ACL alone: anonymous reads are allowed
+    let r = client
+        .get(format!("{base_url}/alice-b/public.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let policy = br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:loch:s3:::alice-b/secret.txt"}]}"#;
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "policy=",
+        policy,
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 204);
+    // The explicit Deny wins over the ACL grant
+    let r = client
+        .get(format!("{base_url}/alice-b/secret.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = client
+        .get(format!("{base_url}/alice-b/public.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_security_policy_with_unsupported_fields_is_rejected() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/cond-b"))
+        .send()
+        .await
+        .unwrap();
+    for policy in [
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::cond-b/*","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","NotAction":"s3:DeleteObject","Action":"s3:GetObject","Resource":"arn:aws:s3:::cond-b/*"}]}"#,
+    ] {
+        let r = client
+            .put(format!("{base_url}/cond-b?policy"))
+            .body(policy)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(r.text().await.unwrap().contains("MalformedPolicy"));
+    }
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_quota_delete_markers_are_refused_once_exceeded() {
+    let (base_url, tmp_dir) = start_server_with_quota(Some(2000)).await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/dm-quota"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base_url}/dm-quota?versioning"))
+        .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+        .send()
+        .await
+        .unwrap();
+    // Delete markers on missing keys are counted and stop at the limit
+    let mut refused = false;
+    for i in 0..200 {
+        let r = client
+            .delete(format!("{base_url}/dm-quota/missing-{i}"))
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 403 {
+            refused = true;
+            break;
+        }
+        assert_eq!(r.status(), 204);
+    }
+    assert!(refused, "delete markers must not grow past the quota");
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_delete_bucket_refused_with_noncurrent_versions_or_uploads() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/del-ver"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base_url}/del-ver?versioning"))
+        .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base_url}/del-ver/k"))
+        .body("v1")
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete(format!("{base_url}/del-ver/k"))
+        .send()
+        .await
+        .unwrap();
+    // Only a delete marker is current, but v1 still exists
+    let r = client
+        .delete(format!("{base_url}/del-ver"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
+    assert!(tmp_dir.join("del-ver/.versions").exists());
+
+    client
+        .put(format!("{base_url}/del-up"))
+        .send()
+        .await
+        .unwrap();
+    let r = client
+        .post(format!("{base_url}/del-up/big?uploads"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = client
+        .delete(format!("{base_url}/del-up"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_complete_multipart_requires_parts() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/mp-empty"))
+        .send()
+        .await
+        .unwrap();
+    let r = client
+        .post(format!("{base_url}/mp-empty/o?uploads"))
+        .send()
+        .await
+        .unwrap();
+    let upload_id = extract_xml_value(&r.text().await.unwrap(), "UploadId");
+    let r = client
+        .post(format!("{base_url}/mp-empty/o?uploadId={upload_id}"))
+        .body("<CompleteMultipartUpload></CompleteMultipartUpload>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = client
+        .head(format!("{base_url}/mp-empty/o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_list_with_multibyte_delimiter_does_not_panic() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/delim-b"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base_url}/delim-b/a%C3%A9b"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    for delimiter in ["%E9", "%C3%A9", "%C3%A9b", "ab"] {
+        let r = client
+            .get(format!(
+                "{base_url}/delim-b?list-type=2&delimiter={delimiter}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "delimiter {delimiter}");
+    }
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cors_rule_with_invalid_header_value_is_rejected() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/cors-nl"))
+        .send()
+        .await
+        .unwrap();
+    let r = client
+        .put(format!("{base_url}/cors-nl?cors"))
+        .body("<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>PUT\n</AllowedMethod></CORSRule></CORSConfiguration>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_create_existing_bucket_error_depends_on_owner() {
+    use reqwest::Method;
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    setup_alice_and_bob(&client, &base_url).await;
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "",
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_eq!(r.status(), 409);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<Code>BucketAlreadyExists</Code>"), "{body}");
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "",
+        b"",
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 409);
+    assert!(
+        r.text()
+            .await
+            .unwrap()
+            .contains("<Code>BucketAlreadyOwnedByYou</Code>")
+    );
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_sse_multipart_over_encrypted_object_gets_fresh_metadata() {
+    let (base_url, tmp_dir, _) = start_server_with_encryption().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/sse-mp"))
+        .send()
+        .await
+        .unwrap();
+    let r = client
+        .put(format!("{base_url}/sse-mp/k"))
+        .header("x-amz-server-side-encryption", "AES256")
+        .body("old encrypted")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .post(format!("{base_url}/sse-mp/k?uploads"))
+        .send()
+        .await
+        .unwrap();
+    let upload_id = extract_xml_value(&r.text().await.unwrap(), "UploadId");
+    let r = client
+        .put(format!(
+            "{base_url}/sse-mp/k?partNumber=1&uploadId={upload_id}"
+        ))
+        .body("new-plain-content")
+        .send()
+        .await
+        .unwrap();
+    let etag = r
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let r = client
+        .post(format!("{base_url}/sse-mp/k?uploadId={upload_id}"))
+        .body(format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .get(format!("{base_url}/sse-mp/k"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.headers().get("x-amz-server-side-encryption").is_none());
+    assert_eq!(r.text().await.unwrap(), "new-plain-content");
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_sse_truncated_ciphertext_is_not_copied() {
+    let (base_url, tmp_dir, _) = start_server_with_encryption().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/sse-trunc"))
+        .send()
+        .await
+        .unwrap();
+    let payload = vec![7u8; 3 * 1024 * 1024];
+    client
+        .put(format!("{base_url}/sse-trunc/o"))
+        .header("x-amz-server-side-encryption", "AES256")
+        .body(payload)
+        .send()
+        .await
+        .unwrap();
+    // Drop the last chunk on disk (2 full chunks left)
+    let path = tmp_dir.join("sse-trunc/o");
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(2 * (1024 * 1024 + 16)).unwrap();
+    drop(f);
+
+    let r = client
+        .put(format!("{base_url}/sse-trunc/copy"))
+        .header("x-amz-copy-source", "/sse-trunc/o")
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        r.status(),
+        200,
+        "a truncated object must not be copied as valid"
+    );
+    assert!(!tmp_dir.join("sse-trunc/copy").exists());
+
+    // A GET fails instead of ending cleanly after 2 MiB
+    let r = client
+        .get(format!("{base_url}/sse-trunc/o"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.bytes().await.is_err(),
+        "truncated body must surface as an error"
+    );
+    cleanup(&tmp_dir);
+}

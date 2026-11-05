@@ -105,10 +105,15 @@ S3 errors are returned as XML (`<Error><Code>…</Code><Message>…</Message>…
 | `QuotaExceeded` | 403 | The write would exceed `S3_MAX_STORAGE_BYTES` (PutObject, UploadPart, CopyObject, CompleteMultipartUpload when already over the limit) |
 | `InvalidRange` | 416 | `Range` header outside the object (`Content-Range: bytes */<size>` is returned) |
 | `EntityTooLarge` | 413 | XML/JSON request body or user metadata above its limit |
-| `RequestTimeout` | 400 | Upload body stalled for 60 s |
+| `RequestTimeout` | 400 | Upload body stalled for 60 s, or slower than 16 KiB/s on average after 60 s |
+| `XAmzContentSHA256Mismatch` | 400 | The body does not match the signed `x-amz-content-sha256` (nothing is stored) |
+| `SignatureDoesNotMatch` | 403 | Bad request signature, or an aws-chunked chunk signature that does not verify |
+| `InvalidObjectKey` | 400 | Key longer than 1 024 bytes, deeper than 64 components, or with a `.`, `..` or empty component (`a/./b`, `a//b`) |
+| `BucketAlreadyExists` | 409 | CreateBucket on a name owned by someone else (`BucketAlreadyOwnedByYou` for the owner) |
+| `BucketNotEmpty` | 409 | DeleteBucket while objects, noncurrent versions or in-progress multipart uploads remain |
 | `NoSuchUpload` | 404 | Unknown or malformed `uploadId` |
 | `NoSuchVersion` | 404 | Unknown or malformed `versionId` |
-| `AccessDenied` | 403 | Missing permission, including on the CopyObject source, or `x-amz-copy-source` not signed |
+| `AccessDenied` | 403 | Missing permission, including on the CopyObject source, or `host` / an `x-amz-*` header (such as `x-amz-copy-source`) not covered by the signature |
 | `InvalidArgument` | 400 | Malformed input (e.g. malformed aws-chunked body, invalid copy source) |
 
 ---
@@ -290,7 +295,8 @@ Bucket policies use the standard AWS IAM JSON format. They control anonymous acc
 
 ### Evaluation Rules
 
-- An explicit `Deny` always takes precedence over an `Allow`.
+- An explicit `Deny` always takes precedence over an `Allow`, and over ACL grants.
+- `Condition`, `NotAction`, `NotResource` and `NotPrincipal` are not supported: a policy using them is rejected with `MalformedPolicy` (never applied without its condition).
 - Without a policy, buckets are private by default (when authentication is enabled).
 - The bucket owner and the root user always have access, regardless of the policy.
 

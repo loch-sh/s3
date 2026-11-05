@@ -12,7 +12,11 @@ pub struct BucketPolicy {
 }
 
 /// A single policy statement.
+/// Unknown fields (`Condition`, `NotAction`, `NotResource`, `NotPrincipal`...)
+/// are rejected: silently ignoring a `Condition` would turn a conditional
+/// Allow into an unconditional one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Statement {
     #[serde(rename = "Sid", skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
@@ -95,7 +99,15 @@ impl BucketPolicy {
     /// Check if a given action on a given resource is allowed for anonymous access.
     /// Returns true if at least one statement explicitly allows AND no statement denies.
     pub fn is_allowed_for_anonymous(&self, action: S3Action, resource: &str) -> bool {
-        let mut allowed = false;
+        self.anonymous_decision(action, resource) == Some(true)
+    }
+
+    /// Policy decision for an anonymous request: `Some(false)` on an explicit
+    /// Deny, `Some(true)` on an Allow without Deny, `None` when no statement
+    /// matches (other grants such as ACLs may then apply, but never override
+    /// an explicit Deny).
+    pub fn anonymous_decision(&self, action: S3Action, resource: &str) -> Option<bool> {
+        let mut allowed = None;
 
         for statement in &self.statement {
             if !statement.is_principal_wildcard() {
@@ -111,8 +123,8 @@ impl BucketPolicy {
             }
 
             match statement.effect {
-                Effect::Deny => return false,
-                Effect::Allow => allowed = true,
+                Effect::Deny => return Some(false),
+                Effect::Allow => allowed = Some(true),
             }
         }
 

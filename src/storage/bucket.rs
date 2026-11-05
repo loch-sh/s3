@@ -88,6 +88,13 @@ impl Storage {
             if !INTERNAL_NAMES.contains(&name_str.as_ref()) {
                 return Err(S3Error::BucketNotEmpty);
             }
+            // Noncurrent versions and in-progress multipart uploads are data
+            // too: S3 refuses to delete such a bucket instead of wiping them
+            if (name_str == ".versions" || name_str == ".uploads")
+                && dir_has_entries(&entry.path()).await
+            {
+                return Err(S3Error::BucketNotEmpty);
+            }
         }
 
         fs::remove_dir_all(&bucket_path)
@@ -170,4 +177,23 @@ async fn read_bucket_creation_date(bucket_path: &std::path::Path) -> SystemTime 
 pub fn format_system_time(time: SystemTime) -> String {
     let dt: DateTime<Utc> = time.into();
     dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// True when the directory tree contains at least one file (empty
+/// subdirectories left behind by removed versions do not count).
+async fn dir_has_entries(path: &std::path::Path) -> bool {
+    fn has_file(path: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        entries.flatten().any(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => has_file(&e.path()),
+            Ok(_) => true,
+            Err(_) => false,
+        })
+    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || has_file(&path))
+        .await
+        .unwrap_or(true)
 }

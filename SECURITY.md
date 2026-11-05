@@ -255,6 +255,84 @@ This document describes the security vulnerabilities that were identified during
 
 **Files:** `src/lib.rs`, `src/storage/object.rs`, `src/main.rs`
 
+### 25. Non-Canonical Keys Reach Internal Files and Bypass Deny (CWE-22, CWE-706) — CRITICAL
+
+**Risk:** object keys with a `.` or empty component (`./.policy.json`, `%2e/.metadata`, `a//b`, `a/./b`) passed validation, which only rejected `..` and checked internal names on the literal first component. The filesystem resolved them to internal files, while authorization evaluated the literal key. Any principal allowed to write a root-level key (including anonymous on a `public-read-write` bucket) could overwrite `.metadata` (take ownership of the bucket), plant a policy or ACL, rewrite object sidecars, read internal state, and bypass `Deny` statements with `./secret/...`.
+
+**Mitigation:** `validate_object_key` rejects `.`, `..` and empty components (only a single trailing `/` is allowed, for directory markers), and the router rejects non-canonical keys before any authorization decision, so policies, ACLs and storage always see the same key. Keys are also limited to 64 components (`MAX_KEY_DEPTH`), so one request cannot create hundreds of directories.
+
+**Files:** `src/storage/mod.rs`, `src/router.rs`
+
+### 26. Request Body Not Bound to the Signature (CWE-345) — MEDIUM
+
+**Risk:** `x-amz-content-sha256` was signed but never compared with the body, and aws-chunked chunk signatures were not verified: a captured request (plain HTTP, compromised proxy) could be replayed within the 15-minute window with another body. Unsigned `x-amz-*` headers (metadata, ACL, SSE) could be added to a signed request.
+
+**Mitigation:** bodies are hashed while streamed and rejected with `400 XAmzContentSHA256Mismatch` on mismatch (objects, parts and XML/JSON configuration bodies); `STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]` chunk signatures are verified as a chain from the request signature (`403 SignatureDoesNotMatch`); nothing is stored when verification fails. Header auth requires `host` and every `x-amz-*` header to be signed; presigned URLs require `host`. Unknown `x-amz-content-sha256` values are refused. `UNSIGNED-PAYLOAD` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER` remain accepted (integrity then relies on TLS).
+
+**Files:** `src/auth.rs`, `src/storage/object.rs`, `src/handlers/mod.rs`, `src/router.rs`
+
+### 27. Plaintext Published Before Encryption (CWE-311) — HIGH
+
+**Risk:** an SSE-S3 or SSE-C upload was renamed to the object path in plaintext, then encrypted in place, with the previous sidecar still in force. A concurrent GET without the SSE-C key could read the plaintext; a crash or an encryption error left the plaintext there permanently.
+
+**Mitigation:** PutObject, CopyObject and CompleteMultipartUpload encrypt the temporary file under `.loch-tmp/` (removed at startup) and only then publish the ciphertext. Plaintext never appears under a bucket. Multipart parts remain plaintext in `.uploads/` until completion (documented).
+
+**Files:** `src/encryption.rs`, `src/storage/object.rs`, `src/storage/multipart.rs`, `src/handlers/object.rs`, `src/handlers/multipart.rs`
+
+### 28. Truncated Ciphertext Served or Copied as Valid (CWE-354) — MEDIUM
+
+**Risk:** decryption stopped silently at end of file: a ciphertext truncated at a chunk boundary was served as a shorter body, and CopyObject turned it into a valid, shorter object.
+
+**Mitigation:** a ciphertext shorter than the recorded plaintext size is an error, both in the streaming decryptor (body aborted) and in `decrypt_file_to` (copy refused).
+
+**Files:** `src/encryption.rs`
+
+### 29. Stale Sidecar After CompleteMultipartUpload (CWE-664) — MEDIUM
+
+**Risk:** completing a plaintext multipart upload over an encrypted object kept the old sidecar: the object was reported as encrypted, could not be read, and inherited the previous object's metadata.
+
+**Mitigation:** the completed object gets a fresh sidecar (owner, ETag, encryption of this upload only).
+
+**Files:** `src/handlers/multipart.rs`
+
+### 30. ACL Grant Overrides an Explicit Deny; Conditions Ignored (CWE-863) — MEDIUM
+
+**Risk:** for anonymous requests the policy result was OR-ed with ACL grants, so a `public-read` ACL defeated an explicit `Deny`. Policy statements with `Condition`, `NotAction`, `NotResource` or `NotPrincipal` were accepted and the unsupported field silently ignored (a conditional Allow became unconditional).
+
+**Mitigation:** an explicit `Deny` always wins; ACLs only apply when no policy statement matches; an unreadable policy file denies. Statements with unknown fields are rejected with `MalformedPolicy`.
+
+**Files:** `src/router.rs`, `src/policy.rs`
+
+### 31. Quota Bypasses and Resource Exhaustion (CWE-400) — MEDIUM
+
+**Risk:**
+- delete markers (versioned DELETE of any key) were written without any quota check;
+- a client could trickle a body (one byte every < 60 s) and keep its full up-front reservation forever;
+- concurrent CompleteMultipartUpload calls of one upload each assembled a full-size copy;
+- connections were not capped and silent connections never closed;
+- every DELETE in a versioned bucket could trigger a full recount;
+- listings hashed every object on each call.
+
+**Mitigation:**
+- delete markers are refused once the quota is reached and counted immediately;
+- uploads slower than 16 KiB/s on average after 60 s are aborted (`RequestTimeout`);
+- one completion at a time per upload;
+- concurrent connections are capped (`S3_MAX_CONNECTIONS`, default 1024), connections that send nothing within 30 s are closed, and HTTP/2 connections are pinged (keep-alive) with at most 128 streams;
+- the recount worker pauses for 4× the duration of each walk;
+- the ETag is stored in the sidecar at write time, and listings no longer read objects written by 1.4.1 or later.
+
+**Files:** `src/storage/versioning.rs`, `src/storage/object.rs`, `src/storage/multipart.rs`, `src/lib.rs`, `src/quota/mod.rs`
+
+### 32. Robustness and Information Leaks — LOW
+
+- ListObjectsV2 with a multi-byte delimiter panicked on a char boundary; fixed.
+- A CORS rule with a control character made every preflight panic; values are validated at PUT and the preflight no longer unwraps.
+- `CompleteMultipartUpload` with no part created an empty object; now `MalformedXML`.
+- Creating an existing bucket returned `BucketAlreadyOwnedByYou` to non-owners; only the owner gets it, others get `BucketAlreadyExists`.
+- Deleting a bucket with noncurrent versions or in-progress uploads wiped them; now `BucketNotEmpty`.
+- Admin API: a change is rolled back in memory when the users file cannot be written; the Bearer key is compared through SHA-256 digests (no length leak).
+- CI: every action is pinned to a commit SHA (Dependabot keeps them updated), workflows default to `contents: read`, `cross` is pinned. The sample `docker-compose.yml` no longer publishes the server port publicly nor embeds an encryption key, and the sample `Caddyfile` blocks `/_loch/users`.
+
 ## Presigned URLs
 
 Presigned URLs embed SigV4 authentication in the query string, enabling time-limited access to specific objects without requiring the caller to have AWS credentials.
@@ -385,7 +463,7 @@ Each version stores its own encryption parameters. Different versions of the sam
 | Customer key | *(nowhere)* | Never stored, only MD5 |
 | Master key | Environment variable or key file | Not persisted by the server |
 | In-progress multipart parts | `.uploads/{id}/{part}` | No (plaintext, encrypted at completion) |
-| `PutObject` body during the write | `{bucket}/{key}` | No, briefly: written, then encrypted in place before the response |
+| Upload being written / encrypted | `.loch-tmp/{uuid}.tmp` | No, until encrypted; never published in plaintext, removed at startup |
 
 ### Error Cases
 
@@ -428,6 +506,28 @@ All direct and transitive dependencies are free of known CVEs as of this date.
 | `ListObjects` ETag/size discrepancy for encrypted objects | Informational | Known — `ListObjects` reports ciphertext size and MD5; `HeadObject` / `GetObject` report plaintext size and plaintext MD5. Correctness gap, not a security issue. |
 | `X-Amz-Expires` has no server-side upper bound | Low | Fixed — values `0` or `> 604 800 s` are rejected with 403 (`MAX_PRESIGNED_EXPIRES_SECS` in `src/auth.rs`). |
 
+### 2026-11-05 — Full Product Security Review (1.4.1)
+
+Internal review of the whole product (authentication, authorization, storage, encryption, HTTP layer, supply chain), each finding reproduced against a running server; regression tests in `tests/integration.rs`.
+
+| Finding | Severity | Status |
+|---------|----------|--------|
+| Dot / empty key segments reach internal files (bucket takeover, Deny bypass) | Critical | Fixed — §25 |
+| Plaintext published before in-place encryption | High | Fixed — §27 |
+| Body not bound to `x-amz-content-sha256`, chunk signatures not verified, unsigned `x-amz-*` headers | Medium | Fixed — §26 |
+| ACL grants override an explicit Deny; `Condition` silently ignored | Medium | Fixed — §30 |
+| Truncated ciphertext served / laundered through CopyObject | Medium | Fixed — §28 |
+| Stale sidecar after CompleteMultipartUpload | Medium | Fixed — §29 |
+| Delete markers outside the quota, trickled uploads holding reservations, concurrent completes, unbounded connections, recount and listing amplification | Medium | Fixed — §31 |
+| Panics (multi-byte delimiter, CORS values), empty complete, bucket deletion with versions, admin API rollback, Bearer length, CI pinning | Low | Fixed — §32 |
+| Quota counts apparent bytes: directories, inodes and block rounding are not counted | Medium | Known — planned for 1.5.0; key depth is capped at 64 components meanwhile. Use a dedicated filesystem or volume quota per tenant for a hard disk limit |
+| Sidecar crypto parameters not authenticated (no AAD binding of key, size, last chunk); SSE ETag is the plaintext MD5 | Medium | Known — needs an on-disk format change, planned for 1.5.0 |
+| Bucket-level `READ` ACL grants GetObject on every object (AWS: listing only) | Medium | Known — behavior kept for compatibility in 1.4.x; use object ACLs or policies, change planned for 1.5.0 |
+| Multipart uploads do not create a version in versioned buckets | Low | Known |
+| Sub-resource reads (`?acl`, `?versioning`, `?versions`) and version deletion authorized with the generic action | Low | Known |
+| Listings walk the whole bucket in memory; ListMultipartUploads is unpaginated | Low | Known |
+| Encryption keys not zeroized in memory | Low | Known |
+
 ### 2026-11-05 — Managed Deployment Audit (1.3.0)
 
 Findings reported by the Loch.sh Panel integration audit, each reproduced by a failing regression test before the fix (`tests/integration.rs`, `test_security_*`).
@@ -442,8 +542,8 @@ Findings reported by the Loch.sh Panel integration audit, each reproduced by a f
 | No storage quota (CWE-400) | Medium | Fixed — §22 |
 | Multipart operations authorized on the URL key, not the upload's key (CWE-639) | Medium | Fixed — §23 |
 | No header-read / body idle timeouts (slowloris, stalled reservations) | Medium | Fixed — §24 (30 s headers, 60 s body idle). Total request duration and connection count are not limited: keep a reverse proxy in front for public exposure |
-| `x-amz-content-sha256` and aws-chunked trailing checksums not verified | Low | Known — integrity relies on TCP/TLS; the ETag is the MD5 of the stored payload |
-| `add_user` updates memory before persisting the users file, without rollback on write failure | Low | Known — admin API only |
+| `x-amz-content-sha256` and aws-chunked trailing checksums not verified | Low | Fixed in 1.4.1 — §26 (trailing checksums are still ignored) |
+| `add_user` updates memory before persisting the users file, without rollback on write failure | Low | Fixed in 1.4.1 — §32 |
 
 ---
 

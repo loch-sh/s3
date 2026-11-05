@@ -14,7 +14,7 @@ pub async fn put_bucket_policy(
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
     // Limit policy body to 20 KB
-    let body = match read_body_limited(req.into_body(), 20 * 1024).await {
+    let body = match read_body_limited(req, 20 * 1024).await {
         Ok(data) => data,
         Err(e) => return error_response(e, &format!("/{}", bucket)),
     };

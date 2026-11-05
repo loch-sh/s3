@@ -11,7 +11,7 @@ pub mod versioning;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::{Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 
 use crate::error::S3Error;
 use crate::xml;
@@ -81,17 +81,36 @@ pub fn etag_response(etag: &str) -> Response<BoxBody> {
         .unwrap()
 }
 
-/// Read request body up to `max_bytes`. Returns EntityTooLarge if exceeded.
-pub async fn read_body_limited(mut body: Incoming, max_bytes: usize) -> Result<Vec<u8>, S3Error> {
+/// Body integrity check attached to the request by the router after
+/// authentication (`PayloadCheck::None` when absent).
+pub fn payload_check(req: &Request<Incoming>) -> crate::auth::PayloadCheck {
+    req.extensions()
+        .get::<crate::auth::PayloadCheck>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Read a request body up to `max_bytes` (EntityTooLarge if exceeded),
+/// decoding aws-chunked bodies and enforcing the signed payload hash or
+/// chunk signatures.
+pub async fn read_body_limited(
+    req: Request<Incoming>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, S3Error> {
+    let check = payload_check(&req);
+    let aws_chunked = crate::handlers::object::is_aws_chunked(&req);
+    let mut body = req.into_body();
+    let mut reader = crate::storage::object::BodyReader::new(aws_chunked, check);
     let mut collected = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| S3Error::InternalError(e.to_string()))?;
         if let Ok(data) = frame.into_data() {
-            collected.extend_from_slice(&data);
+            reader.feed(&data, &mut collected)?;
             if collected.len() > max_bytes {
                 return Err(S3Error::EntityTooLarge);
             }
         }
     }
+    reader.finish()?;
     Ok(collected)
 }

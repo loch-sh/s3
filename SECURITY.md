@@ -309,11 +309,16 @@ Loch S3 supports server-side encryption to protect data at rest. Two modes are a
 
 ### SSE-S3: Server-Managed Keys
 
-**Configuration:** Set `S3_ENCRYPTION_KEY` to a base64-encoded 32-byte master key.
+**Configuration:** Set `S3_ENCRYPTION_KEY` to a base64-encoded 32-byte master key, or `S3_ENCRYPTION_KEY_FILE` to a file holding it (preferred in containers: the environment shows up in `docker inspect`). The two are mutually exclusive; an empty, unreadable or invalid key makes the server exit with status 1. Neither the key nor the file content is ever logged, and `EncryptionConfig` deliberately does not implement `Debug`.
 
 ```bash
 export S3_ENCRYPTION_KEY=$(openssl rand -base64 32)
+# or
+openssl rand -base64 32 > master.key && chmod 0400 master.key
+export S3_ENCRYPTION_KEY_FILE=$PWD/master.key
 ```
+
+**Encryption by default:** `S3_ENCRYPT_BY_DEFAULT=true` applies SSE-S3 to every write without SSE headers (`PutObject`, `CopyObject`, multipart, versions), regardless of the bucket configuration. SSE-C headers take precedence. It requires a master key (startup fails otherwise). Objects written before it was enabled stay in plaintext.
 
 **Key derivation:** The master key is never used directly. A unique data encryption key is derived per object using **HKDF-SHA256** with a random 32-byte salt and the info string `loch-s3-sse-s3`. This ensures that compromising one object does not help decrypt others.
 
@@ -345,7 +350,7 @@ Buckets can be configured with a default encryption policy via `PUT /{bucket}?en
 
 - **Configuration API:** `PUT`, `GET`, `DELETE` on `/{bucket}?encryption` with `ServerSideEncryptionConfiguration` XML body
 - **Algorithm validation:** only `AES256` is accepted; other values return `InvalidArgument`
-- **Automatic application:** `PutObject` and `CreateMultipartUpload` check for bucket default encryption when no SSE headers are present
+- **Automatic application:** `PutObject`, `CopyObject` and `CreateMultipartUpload` check for bucket default encryption when no SSE headers are present (`CopyObject` since 1.4.0)
 - **Requires master key:** bucket default encryption has no effect if `S3_ENCRYPTION_KEY` is not configured (objects are stored in plaintext)
 - **Storage:** configuration is stored as `.encryption.json` inside the bucket directory
 
@@ -378,8 +383,9 @@ Each version stores its own encryption parameters. Different versions of the sam
 | Object data | `{bucket}/{key}` | Yes (ciphertext) |
 | Encryption params | `.meta/{key}.json` | No (nonce, salt, algorithm, plaintext size) |
 | Customer key | *(nowhere)* | Never stored, only MD5 |
-| Master key | Environment variable | Not persisted by the server |
+| Master key | Environment variable or key file | Not persisted by the server |
 | In-progress multipart parts | `.uploads/{id}/{part}` | No (plaintext, encrypted at completion) |
+| `PutObject` body during the write | `{bucket}/{key}` | No, briefly: written, then encrypted in place before the response |
 
 ### Error Cases
 
@@ -394,7 +400,7 @@ Each version stores its own encryption parameters. Different versions of the sam
 
 ### Recommendations
 
-- **Protect the master key.** If `S3_ENCRYPTION_KEY` is lost, SSE-S3 objects cannot be decrypted.
+- **Protect the master key.** If the master key is lost, SSE-S3 objects cannot be decrypted. Prefer `S3_ENCRYPTION_KEY_FILE` (mode `0400`, read-only mount) over the environment variable.
 - **Use HTTPS in production.** SSE protects data at rest; use a TLS reverse proxy (Caddy, Nginx) for data in transit.
 - **Enable authentication.** Without credentials, SSE-C keys are sent in plaintext over HTTP.
 

@@ -385,7 +385,7 @@ Loch S3 supports two encryption modes: SSE-S3 (server-managed key) and SSE-C (cu
 
 ### SSE-S3 — Server-Managed Key
 
-Requires `S3_ENCRYPTION_KEY` to be configured on the server. The key is derived per object via HKDF-SHA256 (random per-object salt + master key). A random 12-byte nonce is generated per object, then modified by chunk index (`nonce XOR chunk_index`).
+Requires a master key on the server (`S3_ENCRYPTION_KEY` or `S3_ENCRYPTION_KEY_FILE`). With `S3_ENCRYPT_BY_DEFAULT=true`, every write without SSE headers (`PutObject`, `CopyObject`, multipart) is encrypted with SSE-S3 and the response carries `x-amz-server-side-encryption: AES256`; SSE-C headers still take precedence. The key is derived per object via HKDF-SHA256 (random per-object salt + master key). A random 12-byte nonce is generated per object, then modified by chunk index (`nonce XOR chunk_index`).
 
 To upload an object with SSE-S3, include the header `x-amz-server-side-encryption: AES256` in the `PutObject` request. Decryption on `GetObject` is transparent — no additional headers are needed.
 

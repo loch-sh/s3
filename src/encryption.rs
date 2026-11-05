@@ -49,9 +49,13 @@ pub struct EncryptionMeta {
 }
 
 /// Server encryption configuration loaded from environment.
+/// Deliberately not `Debug`: the master key must never reach a log line.
 #[derive(Clone)]
 pub struct EncryptionConfig {
     pub master_key: [u8; 32],
+    /// Encrypt with SSE-S3 every write that carries no SSE header
+    /// (`S3_ENCRYPT_BY_DEFAULT`). SSE-C headers still take precedence.
+    pub encrypt_by_default: bool,
 }
 
 /// Parsed SSE request from HTTP headers.

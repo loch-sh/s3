@@ -126,24 +126,97 @@ fn load_user_store() -> Result<Option<Arc<RwLock<UserStore>>>, String> {
     }
 }
 
+/// Load the SSE-S3 master key from `S3_ENCRYPTION_KEY` or from the file named by
+/// `S3_ENCRYPTION_KEY_FILE` (never both), plus the `S3_ENCRYPT_BY_DEFAULT` flag.
+/// Error messages never contain key material.
 fn load_encryption_from_env() -> Result<Option<EncryptionConfig>, String> {
-    let b64_key = match std::env::var("S3_ENCRYPTION_KEY") {
-        Ok(val) => val,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(_) => return Err("S3_ENCRYPTION_KEY contains invalid unicode".to_string()),
+    let inline = read_env_non_empty("S3_ENCRYPTION_KEY")?;
+    let file = read_env_non_empty("S3_ENCRYPTION_KEY_FILE")?;
+    let encrypt_by_default = parse_env_bool("S3_ENCRYPT_BY_DEFAULT", false)?;
+
+    let (b64_key, source) = match (inline, file) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "S3_ENCRYPTION_KEY and S3_ENCRYPTION_KEY_FILE are mutually exclusive: set only one"
+                    .to_string(),
+            );
+        }
+        (Some(key), None) => (key, "S3_ENCRYPTION_KEY".to_string()),
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                format!("S3_ENCRYPTION_KEY_FILE: cannot read '{path}': {}", e.kind())
+            })?;
+            (
+                content.trim_end().to_string(),
+                format!("S3_ENCRYPTION_KEY_FILE ('{path}')"),
+            )
+        }
+        (None, None) => {
+            if encrypt_by_default {
+                return Err(
+                    "S3_ENCRYPT_BY_DEFAULT requires a master key: set S3_ENCRYPTION_KEY_FILE or S3_ENCRYPTION_KEY"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        }
     };
 
     use base64::Engine;
     let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&b64_key)
-        .map_err(|_| "S3_ENCRYPTION_KEY must be valid base64".to_string())?;
+        .decode(b64_key.as_bytes())
+        .map_err(|_| format!("{source} must contain a valid base64 key"))?;
     if key_bytes.len() != 32 {
-        return Err("S3_ENCRYPTION_KEY must be exactly 32 bytes (256 bits)".to_string());
+        return Err(format!(
+            "{source} must contain exactly 32 bytes (256 bits) once base64-decoded"
+        ));
     }
 
     let mut key = [0u8; 32];
     key.copy_from_slice(&key_bytes);
-    Ok(Some(EncryptionConfig { master_key: key }))
+    Ok(Some(EncryptionConfig {
+        master_key: key,
+        encrypt_by_default,
+    }))
+}
+
+/// Read an optional env var that must not be empty when set (an empty key
+/// must not silently disable encryption).
+fn read_env_non_empty(name: &str) -> Result<Option<String>, String> {
+    match read_env_raw(name)? {
+        Some(v) if v.trim().is_empty() => Err(format!("{name} is set but empty")),
+        other => Ok(other),
+    }
+}
+
+fn read_env_raw(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(format!("{name} contains invalid unicode")),
+    }
+}
+
+/// Read an optional env var; unset or empty means `None`.
+fn read_env_opt(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(v) if v.is_empty() => Ok(None),
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(format!("{name} contains invalid unicode")),
+    }
+}
+
+/// Parse a boolean env var: true/false/1/0/yes/no (case-insensitive).
+fn parse_env_bool(name: &str, default: bool) -> Result<bool, String> {
+    match read_env_opt(name)? {
+        None => Ok(default),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(format!("{name} must be true or false, got '{raw}'")),
+        },
+    }
 }
 
 fn load_app_config() -> Result<AppConfig, String> {
@@ -195,10 +268,16 @@ async fn log_startup(addr: SocketAddr, cfg: &AppConfig) {
     if cfg.admin_api_key.is_some() {
         eprintln!("Admin API key: configured");
     }
-    if cfg.encryption.is_some() {
-        eprintln!("Encryption: SSE-S3 enabled");
+    if let Some(enc) = &cfg.encryption {
+        if enc.encrypt_by_default {
+            eprintln!("Encryption: SSE-S3 enabled, applied by default to every write");
+        } else {
+            eprintln!("Encryption: SSE-S3 enabled (on request or bucket default)");
+        }
     } else {
-        eprintln!("Encryption: SSE-S3 disabled (set S3_ENCRYPTION_KEY to enable)");
+        eprintln!(
+            "Encryption: SSE-S3 disabled (set S3_ENCRYPTION_KEY_FILE or S3_ENCRYPTION_KEY to enable)"
+        );
     }
     eprintln!("Upload TTL: {}s", cfg.upload_ttl_secs);
     match cfg.max_storage_bytes {

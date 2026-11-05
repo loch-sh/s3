@@ -293,9 +293,9 @@ fn generate_key(len: usize) -> String {
 
 /// Write data to a file with mode 0600 (owner read/write only).
 fn write_file_restricted(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     #[cfg(unix)]
     {
+        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)

@@ -9617,3 +9617,75 @@ async fn test_list_versions_distinguishes_key_and_directory_marker() {
     assert!(!body.contains(".dir_marker"), "{body}");
     cleanup(&tmp_dir);
 }
+
+#[tokio::test]
+async fn test_security_no_server_or_version_disclosure() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/srv-hdr"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base_url}/srv-hdr/o"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let mut responses = Vec::new();
+    for (method, path) in [
+        (reqwest::Method::GET, "/_loch/health"),
+        (reqwest::Method::GET, "/"),
+        (reqwest::Method::GET, "/srv-hdr?list-type=2"),
+        (reqwest::Method::GET, "/srv-hdr/o"),
+        (reqwest::Method::HEAD, "/srv-hdr/o"),
+        (reqwest::Method::GET, "/srv-hdr/missing"),
+        (reqwest::Method::GET, "/missing-bucket"),
+        (reqwest::Method::OPTIONS, "/srv-hdr/o"),
+        (reqwest::Method::GET, "/_loch/users"),
+    ] {
+        responses.push(
+            client
+                .request(method, format!("{base_url}{path}"))
+                .send()
+                .await
+                .unwrap(),
+        );
+    }
+    for r in responses {
+        let url = r.url().to_string();
+        for name in ["server", "x-powered-by", "x-server-version", "via"] {
+            assert!(
+                r.headers().get(name).is_none(),
+                "{url}: unexpected {name} header"
+            );
+        }
+        for (name, value) in r.headers() {
+            assert!(
+                !value.to_str().unwrap_or("").contains(version),
+                "{url}: {name} leaks the version"
+            );
+        }
+        let body = r.text().await.unwrap();
+        assert!(!body.contains(version), "{url}: body leaks the version");
+        assert!(
+            !body.to_lowercase().contains("hyper"),
+            "{url}: body names the HTTP stack"
+        );
+    }
+
+    // Errors produced by hyper itself (malformed request) carry no Server header either
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(base_url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    s.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw).await;
+    let raw = String::from_utf8_lossy(&raw).to_lowercase();
+    assert!(raw.starts_with("http/1.1 400"), "{raw}");
+    assert!(!raw.contains("\r\nserver:"), "{raw}");
+    cleanup(&tmp_dir);
+}

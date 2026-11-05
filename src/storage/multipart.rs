@@ -298,7 +298,7 @@ impl Storage {
             let _path_guard = self.quota.lock_path(&object_path).await;
             let assembled = file_size(&tmp_path).await;
             let replaced = file_size(&object_path).await;
-            if let Err(e) = fs::rename(&tmp_path, &object_path).await {
+            if let Err(e) = crate::storage::rename_into(&tmp_path, &object_path).await {
                 let _ = fs::remove_file(&tmp_path).await;
                 return Err(S3Error::InternalError(e.to_string()));
             }

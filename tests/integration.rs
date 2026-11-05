@@ -7523,7 +7523,9 @@ async fn test_aws_chunked_incomplete_body_rejected() {
     cleanup(&tmp_dir);
 }
 
-/// Concurrent overwrites and deletes of one key must leave the counter exact.
+/// Concurrent overwrites and deletes of one key must neither fail (deletes remove
+/// directories that become empty, including `.meta/` and the key's parents) nor
+/// leave the counter wrong.
 #[tokio::test]
 async fn test_quota_concurrent_overwrites_same_key_stay_exact() {
     let (base_url, tmp_dir) = start_server_with_quota(Some(100_000_000)).await;
@@ -7533,36 +7535,41 @@ async fn test_quota_concurrent_overwrites_same_key_stay_exact() {
         .send()
         .await
         .unwrap();
-    let url = format!("{}/race-b/same", base_url);
-    let mut tasks = Vec::new();
-    for i in 0..120usize {
-        let client = client.clone();
-        let url = url.clone();
-        tasks.push(tokio::spawn(async move {
-            if i % 3 == 2 {
-                client.delete(&url).send().await.unwrap().status().as_u16()
-            } else {
-                let size = 1_000 + (i * 997) % 50_000;
-                client
-                    .put(&url)
-                    .body(vec![b'r'; size])
-                    .send()
-                    .await
-                    .unwrap()
-                    .status()
-                    .as_u16()
-            }
-        }));
-    }
-    for t in tasks {
-        let status = t.await.unwrap();
-        assert!(status == 200 || status == 204, "status {status}");
+    for key in ["same", "nested/dir/same"] {
+        let url = format!("{}/race-b/{}", base_url, key);
+        let mut tasks = Vec::new();
+        for i in 0..150usize {
+            let client = client.clone();
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                let resp = if i % 3 == 2 {
+                    client.delete(&url).send().await.unwrap()
+                } else {
+                    let size = 1_000 + (i * 997) % 50_000;
+                    client
+                        .put(&url)
+                        .body(vec![b'r'; size])
+                        .send()
+                        .await
+                        .unwrap()
+                };
+                let status = resp.status().as_u16();
+                (status, resp.text().await.unwrap_or_default())
+            }));
+        }
+        for t in tasks {
+            let (status, body) = t.await.unwrap();
+            assert!(
+                status == 200 || status == 204,
+                "{key}: status {status}: {body}"
+            );
+        }
     }
     let used = used_bytes(&client, &base_url).await;
     let actual = s3::quota::data_dir_usage(&tmp_dir);
-    // Exact up to untracked metadata sidecars (rewritten in place, < 1 KiB)
+    // Exact up to untracked metadata sidecars (rewritten in place, < 1 KiB each)
     assert!(
-        used <= actual + 1024 && used + 1024 >= actual,
+        used <= actual + 2048 && used + 2048 >= actual,
         "used {used}, on disk {actual}"
     );
     cleanup(&tmp_dir);

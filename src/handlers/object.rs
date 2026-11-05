@@ -1249,7 +1249,7 @@ pub async fn copy_object(
         let _path_guard = storage.quota.lock_path(&dst_path).await;
         let copied = crate::quota::file_size(&tmp_path).await;
         let replaced = crate::quota::file_size(&dst_path).await;
-        if let Err(e) = tokio::fs::rename(&tmp_path, &dst_path).await {
+        if let Err(e) = crate::storage::rename_into(&tmp_path, &dst_path).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return error_response(S3Error::InternalError(e.to_string()), &resource);
         }

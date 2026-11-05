@@ -120,7 +120,7 @@ impl Storage {
         {
             let _path_guard = self.quota.lock_path(&object_path).await;
             let replaced = file_size(&object_path).await;
-            if let Err(e) = fs::rename(&tmp_path, &object_path).await {
+            if let Err(e) = crate::storage::rename_into(&tmp_path, &object_path).await {
                 let _ = fs::remove_file(&tmp_path).await;
                 return Err(S3Error::InternalError(e.to_string()));
             }
@@ -262,7 +262,7 @@ impl Storage {
         fs::copy(&src_path, &tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        fs::rename(&tmp_path, &dst_path)
+        crate::storage::rename_into(&tmp_path, &dst_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
@@ -326,7 +326,7 @@ impl Storage {
         fs::write(&tmp_path, &json)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        if let Err(e) = fs::rename(&tmp_path, &meta_path).await {
+        if let Err(e) = crate::storage::rename_into(&tmp_path, &meta_path).await {
             let _ = fs::remove_file(&tmp_path).await;
             return Err(S3Error::InternalError(e.to_string()));
         }

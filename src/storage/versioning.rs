@@ -166,7 +166,7 @@ impl Storage {
         fs::copy(source_path, &tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        fs::rename(&tmp_path, &data_path)
+        crate::storage::rename_into(&tmp_path, &data_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
@@ -276,7 +276,7 @@ impl Storage {
         fs::copy(&object_path, &tmp_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        fs::rename(&tmp_path, &null_data_path)
+        crate::storage::rename_into(&tmp_path, &null_data_path)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
@@ -430,7 +430,7 @@ impl Storage {
                     fs::copy(&data_path, &tmp_path)
                         .await
                         .map_err(|e| S3Error::InternalError(e.to_string()))?;
-                    fs::rename(&tmp_path, &object_path)
+                    crate::storage::rename_into(&tmp_path, &object_path)
                         .await
                         .map_err(|e| S3Error::InternalError(e.to_string()))?;
 

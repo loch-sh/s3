@@ -189,6 +189,33 @@ pub fn validate_object_key(key: &str) -> Result<(), S3Error> {
 pub use bucket::BucketInfo;
 pub use object::{ListObjectsResult, ObjectMetadata};
 
+/// Rename a temporary file to its destination, recreating the destination's
+/// parent directory if needed. A concurrent delete removes directories that
+/// become empty (object parents, `.meta/`, version directories) between the
+/// writer's `create_dir_all` and its rename, which would otherwise fail with
+/// `NotFound`. Retries a few times, then returns the last error.
+pub(crate) async fn rename_into(
+    tmp: &std::path::Path,
+    dest: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match tokio::fs::rename(tmp, dest).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 5 => {
+                attempt += 1;
+                // The temporary file itself must still exist; only the parent is recreated
+                if tokio::fs::symlink_metadata(tmp).await.is_err() {
+                    return Err(e);
+                }
+                if let Some(parent) = dest.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Guess MIME content type from file extension.
 pub fn guess_content_type(key: &str) -> String {
     let ext = key.rsplit('.').next().unwrap_or("");

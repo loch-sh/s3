@@ -334,7 +334,7 @@ pub async fn encrypt_file_in_place(
         .map_err(|e| S3Error::InternalError(e.to_string()))?;
     drop(writer);
 
-    if let Err(e) = tokio::fs::rename(tmp_path, path).await {
+    if let Err(e) = crate::storage::rename_into(tmp_path, path).await {
         let _ = tokio::fs::remove_file(tmp_path).await;
         return Err(S3Error::InternalError(e.to_string()));
     }

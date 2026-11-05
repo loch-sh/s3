@@ -199,7 +199,7 @@ impl Storage {
         tmp_path: &std::path::Path,
         metadata: &StoredMetadata,
     ) -> Result<(u64, u64), S3Error> {
-        let _path_guard = self.quota.lock_path(object_path).await;
+        let path_guard = self.quota.lock_path(object_path).await;
         let meta_path = self.object_meta_path(bucket, key)?;
         let previous_sidecar = fs::read(&meta_path).await.ok();
         if let Err(e) = self.put_object_metadata(bucket, key, metadata).await {
@@ -222,6 +222,9 @@ impl Storage {
             }
             return Err(super::path_conflict_error(e));
         }
+        // Release the data lock first: delete_object_acl takes the ACL path
+        // lock (stripes must never nest)
+        drop(path_guard);
         // A new object starts private, as on S3: an ACL granted on the object
         // it replaces (e.g. public-read) must not carry over
         let _ = self.delete_object_acl(bucket, key).await;

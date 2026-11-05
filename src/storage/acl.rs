@@ -85,6 +85,9 @@ impl Storage {
     pub async fn delete_object_acl(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
         let acl_path = self.object_acl_path(bucket, key)?;
         if is_regular_file(&acl_path).await {
+            // Same lock as write_acl_file: a concurrent PUT ?acl cannot
+            // release the same bytes twice. Callers must not hold a path lock.
+            let _path_guard = self.quota.lock_path(&acl_path).await;
             let size = crate::quota::file_size(&acl_path).await;
             if fs::remove_file(&acl_path).await.is_ok() {
                 self.quota.release(size);

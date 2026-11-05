@@ -13,13 +13,15 @@ RUN cargo build --release --locked
 
 # Stage 2: Runtime
 FROM mirror.gcr.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-# Fixed, unprivileged uid/gid. The server also runs under any other uid
+# Fixed, unprivileged uid/gid 100:101: the values Alpine assigned to the `s3`
+# system user in images up to 1.2.0, so existing /data volumes stay writable.
+# The server also runs under any other uid
 # (e.g. `docker run --user 1234:1234`) as long as it can write S3_DATA_DIR.
-RUN addgroup -S -g 10001 s3 && adduser -S -u 10001 -G s3 -H -h /data s3
+RUN addgroup -S -g 101 s3 && adduser -S -u 100 -G s3 -H -h /data s3
 COPY --from=builder /app/target/release/s3 /usr/local/bin/s3
 COPY --from=builder /app/target/release/loch-s3 /usr/local/bin/loch-s3
-RUN mkdir -p /data && chown 10001:10001 /data
-USER 10001:10001
+RUN mkdir -p /data && chown 100:101 /data
+USER 100:101
 EXPOSE 8080
 ENV S3_PORT=8080
 ENV S3_DATA_DIR=/data

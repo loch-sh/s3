@@ -66,7 +66,7 @@ Multi-architecture images (`linux/amd64` + `linux/arm64`) are published to GitHu
 ghcr.io/loch-sh/s3
 ```
 
-The image runs as the fixed unprivileged user `10001:10001`, stores data in `/data` and ships a Docker healthcheck on `GET /_loch/health`. It works with a read-only root filesystem: see [Managed and hardened deployment](deployment.md).
+The image runs as the fixed unprivileged user `100:101` (unchanged since 1.0, so existing volumes keep working), stores data in `/data` and ships a Docker healthcheck on `GET /_loch/health`. It works with a read-only root filesystem: see [Managed and hardened deployment](deployment.md).
 
 ### Minimal Launch (No Authentication)
 

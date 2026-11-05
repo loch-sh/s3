@@ -23,7 +23,7 @@ This page describes how to run Loch S3 as a managed service (one container per t
 |------|-------|
 | Image | `ghcr.io/loch-sh/s3:<version>` (multi-arch `linux/amd64`, `linux/arm64`) |
 | Base images | `mirror.gcr.io/library/rust:1.97.1-alpine3.24` (build), `mirror.gcr.io/library/alpine:3.24.3` (runtime), pinned by digest |
-| User | `10001:10001` (numeric, fixed). Any other uid works too (`--user`), as long as it can write `S3_DATA_DIR` |
+| User | `100:101` (numeric, fixed, same as all previous releases). Any other uid works too (`--user`), as long as it can write `S3_DATA_DIR` |
 | Port | `8080` (`S3_PORT`) |
 | Data | `/data` (`S3_DATA_DIR`), declared as a volume |
 | Healthcheck | Built in: `wget -q -O /dev/null http://127.0.0.1:${S3_PORT}/_loch/health` every 30 s |
@@ -40,7 +40,7 @@ The server only writes to `S3_DATA_DIR`. It runs with:
 docker run -d \
   --read-only --tmpfs /tmp:size=16m \
   --cap-drop ALL --security-opt no-new-privileges \
-  --user 10001:10001 \
+  --user 100:101 \
   --memory 128m --cpus 0.5 --pids-limit 64 \
   -v /srv/tenant-a/data:/data \
   -v /srv/tenant-a/conf:/etc/s3:ro \
@@ -61,7 +61,7 @@ services:
     tmpfs: ["/tmp:size=16m"]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    user: "10001:10001"
+    user: "100:101"
     mem_limit: 128m
     cpus: 0.5
     pids_limit: 64
@@ -81,7 +81,7 @@ services:
 | users file (directory or file) | read-only | container uid, file mode `0400` | Never written when `S3_ADMIN_API_KEY` is unset |
 | `/tmp` | tmpfs (optional) | — | Not used by the server; harmless to provide |
 
-Tested: read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, uid `10001` (image default) and an arbitrary uid via `--user`, users file `0400` in a `0555` directory mounted read-only, memory/CPU/PID limits.
+Tested: read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, uid `100` (image default) and an arbitrary uid via `--user`, users file `0400` in a `0555` directory mounted read-only, memory/CPU/PID limits.
 
 ---
 

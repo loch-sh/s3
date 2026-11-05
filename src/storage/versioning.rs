@@ -13,6 +13,32 @@ use crate::storage::bucket::format_system_time;
 const VERSIONING_FILE: &str = ".versioning.json";
 const VERSIONS_DIR: &str = ".versions";
 
+/// Last (timestamp, suffix) handed out by `generate_version_id`.
+static LAST_VERSION: std::sync::Mutex<(i64, u32)> = std::sync::Mutex::new((0, 0));
+
+/// Random starting suffix. The top bit stays clear so that many IDs can be
+/// generated in the same millisecond before the suffix overflows.
+fn random_suffix() -> u32 {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) >> 1
+}
+
+/// Compute the next (timestamp, suffix) pair, strictly greater than the
+/// previous one: same or earlier millisecond → previous suffix + 1.
+fn next_version_parts(now_ms: i64, random: u32) -> (i64, u32) {
+    let mut last = LAST_VERSION.lock().unwrap_or_else(|e| e.into_inner());
+    let next = if now_ms > last.0 {
+        (now_ms, random)
+    } else {
+        match last.1.checked_add(1) {
+            Some(suffix) => (last.0, suffix),
+            None => (last.0 + 1, random),
+        }
+    };
+    *last = next;
+    next
+}
+
 /// Versioning status for a bucket.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VersioningStatus {
@@ -121,12 +147,14 @@ impl Storage {
 
     // -- Version ID generation --
 
-    /// Generate a sortable version ID: {14-digit-ms-timestamp}-{8-hex-random}.
+    /// Generate a sortable version ID: {14-digit-ms-timestamp}-{8-hex}.
+    ///
+    /// IDs are strictly increasing within the process, so the latest version
+    /// is always the last one created, even for several writes in the same
+    /// millisecond or when the clock steps back.
     pub fn generate_version_id() -> String {
-        let ts = Utc::now().timestamp_millis();
-        let uuid = uuid::Uuid::new_v4();
-        let hex = format!("{:x}", uuid);
-        format!("{:014}-{}", ts, &hex[..8])
+        let (ts, suffix) = next_version_parts(Utc::now().timestamp_millis(), random_suffix());
+        format!("{:014}-{:08x}", ts, suffix)
     }
 
     // -- Path helpers --
@@ -812,6 +840,34 @@ async fn is_dir_empty(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_version_ids_strictly_increase() {
+        use super::validate_version_id;
+        // Thousands of IDs within a few milliseconds: each must sort after
+        // the previous one and stay valid.
+        let mut prev = crate::storage::Storage::generate_version_id();
+        for _ in 0..5000 {
+            let next = crate::storage::Storage::generate_version_id();
+            assert!(next > prev, "{next} should sort after {prev}");
+            assert!(validate_version_id(&next).is_ok());
+            prev = next;
+        }
+    }
+
+    #[test]
+    fn test_next_version_parts_clock_and_overflow() {
+        use super::next_version_parts;
+        // Far in the future so the global state of other tests does not interfere.
+        let t = 99_999_999_999_000;
+        assert_eq!(next_version_parts(t, 5), (t, 5));
+        // Same millisecond, and clock stepping back: suffix + 1
+        assert_eq!(next_version_parts(t, 1), (t, 6));
+        assert_eq!(next_version_parts(t - 10, 1), (t, 7));
+        // Suffix overflow moves to the next millisecond
+        assert_eq!(next_version_parts(t + 1, u32::MAX), (t + 1, u32::MAX));
+        assert_eq!(next_version_parts(t + 1, 3), (t + 2, 3));
+    }
+
     #[test]
     fn test_validate_version_id() {
         use super::validate_version_id;

@@ -22,7 +22,7 @@ This page describes how to run Loch S3 as a managed service (one container per t
 | Item | Value |
 |------|-------|
 | Image | `ghcr.io/loch-sh/s3:<version>` (multi-arch `linux/amd64`, `linux/arm64`) |
-| Base images | `mirror.gcr.io/library/rust:1.97.1-alpine3.24` (build), `mirror.gcr.io/library/alpine:3.24.3` (runtime), pinned by digest |
+| Base images | `mirror.gcr.io/library/rust:1.99.1-alpine3.24` (build), `mirror.gcr.io/library/alpine:3.24.3` (runtime), pinned by digest |
 | User | `100:101` (numeric, fixed, same as all previous releases). Any other uid works too (`--user`), as long as it can write `S3_DATA_DIR` |
 | Port | `8080` (`S3_PORT`) |
 | Data | `/data` (`S3_DATA_DIR`), declared as a volume |

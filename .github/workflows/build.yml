@@ -30,10 +30,10 @@ jobs:
             suffix: macos-arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -83,7 +83,7 @@ jobs:
         if: contains(matrix.target, 'windows')
         run: zip s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}.zip target/${{ matrix.target }}/release/s3.exe target/${{ matrix.target }}/release/loch-s3.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: s3-${{ matrix.suffix }}-${{ steps.branch.outputs.name }}
           path: |

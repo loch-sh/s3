@@ -227,12 +227,14 @@ On `SIGTERM` (container stop) or `SIGINT`, the server stops accepting connection
 | Connections | At most `S3_MAX_CONNECTIONS` (default 1024) at once; extra connections are closed right away. A connection that sends nothing within 30 s is closed |
 | Request headers (HTTP/1) | Must be received within 30 s |
 | HTTP/2 | Keep-alive ping every 30 s (dropped after 20 s without answer), 128 concurrent streams per connection |
-| Upload body | Aborted after 60 s without data, or when slower than 16 KiB/s on average after the first 60 s (`400 RequestTimeout`) |
+| Upload body | Aborted after 60 s without data, or when less than 4 KiB/s arrives over a 60 s window (`400 RequestTimeout`; `S3_MIN_UPLOAD_RATE` in bytes/s, `0` disables) |
+| Stored headers | `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Expires`: 8 KiB in total (`413 EntityTooLarge`); object ACL body 16 KiB |
 | Object size (PutObject, UploadPart) | No server limit other than the quota and disk space; the body is streamed to disk |
 | Multipart upload | Parts are numbered by the client; no server limit on part size or count; parts expire after `S3_UPLOAD_TTL` (default 24 h) |
 | XML/JSON request bodies | Read in memory with a per-endpoint limit: bucket policy 20 KiB; CORS, ACL, encryption and versioning configurations 64 KiB; `CompleteMultipartUpload` 10 MB. Beyond: `413 EntityTooLarge` |
 | User metadata (`x-amz-meta-*`) | 2 048 bytes in total (AWS limit), `EntityTooLarge` (413) beyond |
-| Object key | 1 024 bytes, at most 64 `/`-separated components; `.`, `..` and empty components are rejected (`400 InvalidObjectKey`), except a single trailing `/` |
+| Object key | 1 024 bytes, at most 64 `/`-separated components; `.`, `..` and empty components are rejected (`400 InvalidObjectKey`), except a single trailing `/`. Keys written by older versions with `//` or `./` are stored under their normalized path and reachable only through it. A key that is also the "directory" of another key (`a` and `a/b`, `k` and `k.json/x`) is refused with `400 InvalidObjectKey` |
+| Filesystem | The data directory must be case-sensitive (Linux ext4/xfs/overlayfs): on a case-insensitive one (macOS, Windows, Docker Desktop bind mounts) keys differing only by case share one file and policy prefixes can be bypassed; the server logs a warning at startup |
 | aws-chunked chunk header line | 4 096 bytes |
 | Presigned URL expiry | 1 s to 7 days |
 

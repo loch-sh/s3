@@ -80,6 +80,12 @@ pub enum S3Action {
     DeleteObject,
     ListBucket,
     GetBucketLocation,
+    /// GET/HEAD with `versionId`
+    GetObjectVersion,
+    /// DELETE with `versionId` (permanent removal of a version)
+    DeleteObjectVersion,
+    /// `GET /bucket?versions`
+    ListBucketVersions,
 }
 
 impl S3Action {
@@ -91,8 +97,61 @@ impl S3Action {
             S3Action::DeleteObject => "s3:DeleteObject",
             S3Action::ListBucket => "s3:ListBucket",
             S3Action::GetBucketLocation => "s3:GetBucketLocation",
+            S3Action::GetObjectVersion => "s3:GetObjectVersion",
+            S3Action::DeleteObjectVersion => "s3:DeleteObjectVersion",
+            S3Action::ListBucketVersions => "s3:ListBucketVersions",
         }
     }
+
+    /// Policy action names that apply to this operation. Version operations
+    /// also answer to their base action: an `Allow s3:GetObject` keeps
+    /// granting version reads (compatibility), while a `Deny` on either
+    /// name applies.
+    pub fn policy_names(&self) -> &'static [&'static str] {
+        match self {
+            S3Action::GetObjectVersion => &["s3:GetObjectVersion", "s3:GetObject"],
+            S3Action::DeleteObjectVersion => &["s3:DeleteObjectVersion", "s3:DeleteObject"],
+            S3Action::ListBucketVersions => &["s3:ListBucketVersions", "s3:ListBucket"],
+            S3Action::GetObject => &["s3:GetObject"],
+            S3Action::PutObject => &["s3:PutObject"],
+            S3Action::DeleteObject => &["s3:DeleteObject"],
+            S3Action::ListBucket => &["s3:ListBucket"],
+            S3Action::GetBucketLocation => &["s3:GetBucketLocation"],
+        }
+    }
+}
+
+/// Case-insensitive match of an IAM action pattern (`*` and `?` wildcards),
+/// as AWS does: `*`, `s3:*`, `s3:Get*`, `s3:getobject` all match `s3:GetObject`.
+fn action_pattern_matches(pattern: &str, name: &str) -> bool {
+    fn glob(p: &[u8], n: &[u8]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => glob(&p[1..], n) || (!n.is_empty() && glob(p, &n[1..])),
+            (Some(b'?'), Some(_)) => glob(&p[1..], &n[1..]),
+            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => glob(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    glob(pattern.as_bytes(), name.as_bytes())
+}
+
+/// A policy action must be `*` or an `s3:` action name (wildcards allowed).
+fn is_valid_action_pattern(pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let Some(name) = pattern
+        .get(..3)
+        .filter(|p| p.eq_ignore_ascii_case("s3:"))
+        .map(|_| &pattern[3..])
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'*' || b == b'?')
 }
 
 impl BucketPolicy {
@@ -192,12 +251,16 @@ impl Statement {
     }
 
     fn matches_action(&self, action: S3Action) -> bool {
-        let action_str = action.as_str();
         let actions: Vec<&str> = match &self.action {
             ActionSet::Single(s) => vec![s.as_str()],
             ActionSet::Multiple(v) => v.iter().map(|s| s.as_str()).collect(),
         };
-        actions.iter().any(|a| *a == "s3:*" || *a == action_str)
+        actions.iter().any(|pattern| {
+            action
+                .policy_names()
+                .iter()
+                .any(|name| action_pattern_matches(pattern, name))
+        })
     }
 
     fn matches_resource(&self, resource: &str) -> bool {
@@ -236,6 +299,18 @@ pub fn parse_policy(json_bytes: &[u8]) -> Result<BucketPolicy, S3Error> {
 
     if policy.statement.is_empty() {
         return Err(S3Error::MalformedPolicy);
+    }
+
+    // An invalid action (other service, stray characters) is refused rather
+    // than silently never matching (a Deny that does nothing)
+    for statement in &policy.statement {
+        let actions: Vec<&str> = match &statement.action {
+            ActionSet::Single(s) => vec![s.as_str()],
+            ActionSet::Multiple(v) => v.iter().map(|s| s.as_str()).collect(),
+        };
+        if actions.is_empty() || !actions.iter().all(|a| is_valid_action_pattern(a)) {
+            return Err(S3Error::MalformedPolicy);
+        }
     }
 
     Ok(policy)

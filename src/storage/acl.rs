@@ -12,10 +12,15 @@ impl Storage {
     /// Store a bucket-level ACL.
     pub async fn put_bucket_acl(&self, bucket: &str, acl_xml: &[u8]) -> Result<(), S3Error> {
         self.head_bucket(bucket).await?;
+        self.quota.check_not_exceeded()?;
         let path = self.data_dir.join(bucket).join(BUCKET_ACL_FILE);
+        let replaced = crate::quota::file_size(&path).await;
         fs::write(&path, acl_xml)
             .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))
+            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        self.quota.add(acl_xml.len() as u64);
+        self.quota.release(replaced);
+        Ok(())
     }
 
     /// Read a bucket-level ACL. Returns None if no ACL has been set.
@@ -46,9 +51,14 @@ impl Storage {
                 .await
                 .map_err(|e| S3Error::InternalError(e.to_string()))?;
         }
+        self.quota.check_not_exceeded()?;
+        let replaced = crate::quota::file_size(&acl_path).await;
         fs::write(&acl_path, acl_xml)
             .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))
+            .map_err(super::path_conflict_error)?;
+        self.quota.add(acl_xml.len() as u64);
+        self.quota.release(replaced);
+        Ok(())
     }
 
     /// Read an object-level ACL. Returns None if no ACL has been set.
@@ -72,7 +82,10 @@ impl Storage {
     pub async fn delete_object_acl(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
         let acl_path = self.object_acl_path(bucket, key)?;
         if is_regular_file(&acl_path).await {
-            let _ = fs::remove_file(&acl_path).await;
+            let size = crate::quota::file_size(&acl_path).await;
+            if fs::remove_file(&acl_path).await.is_ok() {
+                self.quota.release(size);
+            }
             // Clean up empty parent directories up to .acl/
             let acl_root = self.data_dir.join(bucket).join(ACL_DIR);
             let mut current = acl_path.parent().map(|p| p.to_path_buf());

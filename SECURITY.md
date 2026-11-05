@@ -315,8 +315,8 @@ This document describes the security vulnerabilities that were identified during
 
 **Mitigation:**
 - delete markers are refused once the quota is reached and counted immediately;
-- uploads slower than 16 KiB/s on average after 60 s are aborted (`RequestTimeout`);
-- one completion at a time per upload;
+- uploads that send less than 4 KiB/s over any 60 s window are aborted (`RequestTimeout`; `S3_MIN_UPLOAD_RATE`, 0 disables). A window, not an average since the start, so an early burst gives no credit;
+- one completion at a time per upload (in-memory claim released even when the request is cancelled; temporary files are removed when a write is cancelled);
 - concurrent connections are capped (`S3_MAX_CONNECTIONS`, default 1024), connections that send nothing within 30 s are closed, and HTTP/2 connections are pinged (keep-alive) with at most 128 streams;
 - the recount worker pauses for 4× the duration of each walk;
 - the ETag is stored in the sidecar at write time, and listings no longer read objects written by 1.4.1 or later.
@@ -332,6 +332,54 @@ This document describes the security vulnerabilities that were identified during
 - Deleting a bucket with noncurrent versions or in-progress uploads wiped them; now `BucketNotEmpty`.
 - Admin API: a change is rolled back in memory when the users file cannot be written; the Bearer key is compared through SHA-256 digests (no length leak).
 - CI: every action is pinned to a commit SHA (Dependabot keeps them updated), workflows default to `contents: read`, `cross` is pinned. The sample `docker-compose.yml` no longer publishes the server port publicly nor embeds an encryption key, and the sample `Caddyfile` blocks `/_loch/users`.
+
+### 33. Directory-Marker Key Shares the Versions of Another Key (CWE-706) — HIGH
+
+**Risk:** the versions of a directory-marker key `pub/` were stored in `.versions/pub/`, the directory of the key `pub` (`Path::join` drops the trailing slash). A user allowed only on `bucket/pub/*` could read and permanently delete the versions of `pub`, or hide it behind a delete marker.
+
+**Mitigation:** a directory-marker key keeps its versions in `.versions/pub/.dir_marker/`, mirroring its data file; listings map that path back to `pub/`. Versions of markers written before 1.4.1 stay in the old directory.
+
+**Files:** `src/storage/versioning.rs`
+
+### 34. Object Published Without Its Sidecar (CWE-664) — HIGH
+
+**Risk:** the data was renamed into place before its sidecar was written. When the sidecar could not be written (layout conflicts such as keys `k` and `k.json/x`, `a` and `a/b`, a name too long once suffixed), the request failed with 500 but the object was published: metadata lost, and with SSE the raw ciphertext was served as the object. CopyObject ignored the sidecar error.
+
+**Mitigation:** PutObject, CopyObject and CompleteMultipartUpload publish through one function that writes the sidecar first and then renames the data under the per-path lock; if the sidecar cannot be written nothing is published (`400 InvalidObjectKey` for layout conflicts) and the created directories are removed; if the rename fails the previous sidecar is restored.
+
+**Files:** `src/storage/object.rs`, `src/storage/multipart.rs`, `src/handlers/object.rs`, `src/handlers/multipart.rs`
+
+### 35. Presigned URLs Accepted Unsigned x-amz-* Headers (CWE-345) — HIGH
+
+**Risk:** the holder of a presigned PUT URL could add `x-amz-acl: public-read`, SSE-C headers (object unreadable by its owner) or metadata.
+
+**Mitigation:** presigned URLs, like header auth, require `host` and every `x-amz-*` header present to be signed (`403 AccessDenied` otherwise), as AWS does.
+
+**Files:** `src/auth.rs`
+
+### 36. Policy Actions Silently Ignored; Versions Authorized as Current Objects (CWE-863) — MEDIUM
+
+**Risk:** only `s3:*` and five exact action names were recognized: `"*"`, `s3:Get*` or `s3:getobject` in a Deny did nothing. Version reads, version deletions and version listings were authorized as GetObject, DeleteObject and ListBucket, so a Deny on `s3:GetObjectVersion` or `s3:DeleteObjectVersion` had no effect.
+
+**Mitigation:** actions match as on AWS (case-insensitive, `*` and `?` wildcards, `"*"` for everything); actions that are not `*` or `s3:<name>` are rejected with `MalformedPolicy`. Requests with `versionId` are evaluated as `s3:GetObjectVersion` / `s3:DeleteObjectVersion` and `?versions` as `s3:ListBucketVersions`; each also answers to its base action, so existing `Allow s3:GetObject` policies keep working while a Deny on either name applies.
+
+**Files:** `src/policy.rs`, `src/router.rs`
+
+### 37. Quota Bypass Through Sidecars and ACLs (CWE-400) — MEDIUM
+
+**Risk:** sidecars (standard headers were uncapped) and ACL files were not counted until the next recount: a writer could store many times the quota, then lock the tenant out at the next recount.
+
+**Mitigation:** sidecars and ACLs are counted when written and released when deleted; the standard headers stored in a sidecar are capped at 8 KiB (`413 EntityTooLarge`), ACL bodies at 16 KiB; ACL writes are refused once the quota is reached.
+
+**Files:** `src/storage/object.rs`, `src/storage/acl.rs`, `src/handlers/object.rs`, `src/router.rs`
+
+### 38. Other Fixes From the Independent Review — LOW to MEDIUM
+
+- **ACL carried over on overwrite (MEDIUM):** a `public-read` object ACL survived PutObject, CopyObject or CompleteMultipartUpload of a new object; a new object now starts private, as on S3.
+- **Case-insensitive filesystems (macOS, Windows, Docker Desktop bind mounts):** internal names (`.METADATA`, `.Policy.Json`) and `.dir_marker` are rejected in any case, so they can no longer be overwritten. On Windows, `\`, `:` and a trailing `.` or space are also rejected in key components. The server logs a warning at startup when the data directory is case-insensitive: policies still match keys case-sensitively there, so production must use a case-sensitive filesystem.
+- **Hidden keys:** keys such as `d/.meta` are listed again (internal names are only skipped at the bucket root).
+- **Duplicate metadata:** a repeated `x-amz-meta-*` header is refused (only the first value is signed).
+- **accept() errors:** they back off for 100 ms instead of spinning.
 
 ## Presigned URLs
 
@@ -520,6 +568,11 @@ Internal review of the whole product (authentication, authorization, storage, en
 | Stale sidecar after CompleteMultipartUpload | Medium | Fixed — §29 |
 | Delete markers outside the quota, trickled uploads holding reservations, concurrent completes, unbounded connections, recount and listing amplification | Medium | Fixed — §31 |
 | Panics (multi-byte delimiter, CORS values), empty complete, bucket deletion with versions, admin API rollback, Bearer length, CI pinning | Low | Fixed — §32 |
+| Second, independent pass (three reviewers, findings verified by a separate model): directory-marker versions, object published without sidecar, presigned unsigned headers, ignored policy actions, sidecar/ACL quota bypass, ACL carried over, case-insensitive internal names, cancelled-Complete regression, upload rate too aggressive | High to Low | Fixed — §31 (rate, cancellation), §33–§38 |
+| Case-insensitive data directories (macOS, Windows): policy prefixes compared case-sensitively | High on those platforms | Known — startup warning; production must use a case-sensitive filesystem (Linux) |
+| Multipart Complete creates no version; concurrent PUTs on a versioned key can store the other writer's bytes in a version | Medium | Known — versioning integrity, planned for 1.5.0 |
+| HTTP/2 connections that answer pings are never idle-timed-out | Low | Known — run behind a reverse proxy |
+| Content-MD5 and trailing `x-amz-checksum-*` not verified; `x-amz-content-sha256` optional | Low | Known |
 | Quota counts apparent bytes: directories, inodes and block rounding are not counted | Medium | Known — planned for 1.5.0; key depth is capped at 64 components meanwhile. Use a dedicated filesystem or volume quota per tenant for a hard disk limit |
 | Sidecar crypto parameters not authenticated (no AAD binding of key, size, last chunk); SSE ETag is the plaintext MD5 | Medium | Known — needs an on-disk format change, planned for 1.5.0 |
 | Bucket-level `READ` ACL grants GetObject on every object (AWS: listing only) | Medium | Known — behavior kept for compatibility in 1.4.x; use object ACLs or policies, change planned for 1.5.0 |

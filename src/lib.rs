@@ -79,6 +79,8 @@ pub async fn serve_with_shutdown(
                 Ok(conn) => conn,
                 Err(e) => {
                     eprintln!("Failed to accept connection: {}", e);
+                    // e.g. EMFILE: back off instead of spinning on the error
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             },

@@ -17,6 +17,13 @@ use crate::quota::{Reservation, file_size};
 
 const META_DIR: &str = ".meta";
 
+impl StoredMetadata {
+    /// Parse a sidecar, falling back to defaults for unreadable content.
+    pub(crate) fn from_bytes(data: &[u8]) -> Self {
+        serde_json::from_slice(data).unwrap_or_default()
+    }
+}
+
 /// Persisted object metadata (system headers + user-defined x-amz-meta-*).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct StoredMetadata {
@@ -93,6 +100,7 @@ impl Storage {
         aws_chunked: bool,
         check: PayloadCheck,
         encrypt: Option<&crate::encryption::EncryptRequest>,
+        mut metadata: StoredMetadata,
         mut reservation: Reservation,
     ) -> Result<(String, Option<EncryptionMeta>), S3Error> {
         self.head_bucket(bucket).await?;
@@ -101,7 +109,7 @@ impl Storage {
         if let Some(parent) = object_path.parent() {
             fs::create_dir_all(parent)
                 .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                .map_err(super::path_conflict_error)?;
         }
 
         // UUID-based temp file to prevent TOCTOU race conditions
@@ -110,7 +118,7 @@ impl Storage {
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
-        let (etag, written) = match stream_body_to_file(
+        let (etag, _written) = match stream_body_to_file(
             &mut file,
             body,
             aws_chunked,
@@ -140,25 +148,72 @@ impl Storage {
             },
             None => None,
         };
+        metadata.encryption = encryption.clone();
+        // Stored for every object: listings and HEAD never re-read the data
+        metadata.etag = Some(etag.clone());
+        let (stored, replaced) = self
+            .publish_object(bucket, key, &object_path, &tmp_path, &metadata)
+            .await?;
         // Ciphertext is slightly larger than the payload (GCM tags)
-        let stored = if encryption.is_some() {
-            file_size(&tmp_path).await
-        } else {
-            written
-        };
-
-        {
-            let _path_guard = self.quota.lock_path(&object_path).await;
-            let replaced = file_size(&object_path).await;
-            if let Err(e) = crate::storage::rename_into(&tmp_path, &object_path).await {
-                let _ = fs::remove_file(&tmp_path).await;
-                return Err(S3Error::InternalError(e.to_string()));
-            }
-            reservation.commit(stored);
-            self.quota.release(replaced);
-        }
+        reservation.commit(stored);
+        self.quota.release(replaced);
 
         Ok((etag, encryption))
+    }
+
+    /// Remove the empty directories between `path` and the bucket root.
+    async fn remove_empty_parents(&self, bucket: &str, path: &std::path::Path) {
+        let bucket_root = self.data_dir.join(bucket);
+        let mut current = path.parent().map(|p| p.to_path_buf());
+        while let Some(dir) = current {
+            if dir == bucket_root || fs::remove_dir(&dir).await.is_err() {
+                break;
+            }
+            current = dir.parent().map(|p| p.to_path_buf());
+        }
+    }
+
+    /// Publish a fully written temporary file as object `key`, with its
+    /// sidecar, under the per-path lock. The sidecar goes first: if it cannot
+    /// be written nothing is published (an encrypted object can never be
+    /// served without its parameters). If the data rename then fails, the
+    /// previous sidecar is restored. Returns (published bytes, replaced bytes);
+    /// the caller settles the data bytes with the quota.
+    pub(crate) async fn publish_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        object_path: &std::path::Path,
+        tmp_path: &std::path::Path,
+        metadata: &StoredMetadata,
+    ) -> Result<(u64, u64), S3Error> {
+        let _path_guard = self.quota.lock_path(object_path).await;
+        let meta_path = self.object_meta_path(bucket, key)?;
+        let previous_sidecar = fs::read(&meta_path).await.ok();
+        if let Err(e) = self.put_object_metadata(bucket, key, metadata).await {
+            // Drop the parent directories created for this object, if empty
+            self.remove_empty_parents(bucket, object_path).await;
+            return Err(e);
+        }
+
+        let stored = file_size(tmp_path).await;
+        let replaced = file_size(object_path).await;
+        if let Err(e) = crate::storage::rename_into(tmp_path, object_path).await {
+            match previous_sidecar {
+                Some(old) => {
+                    let restored = StoredMetadata::from_bytes(&old);
+                    let _ = self.put_object_metadata(bucket, key, &restored).await;
+                }
+                None => {
+                    let _ = self.delete_object_metadata(bucket, key).await;
+                }
+            }
+            return Err(super::path_conflict_error(e));
+        }
+        // A new object starts private, as on S3: an ACL granted on the object
+        // it replaces (e.g. public-read) must not carry over
+        let _ = self.delete_object_acl(bucket, key).await;
+        Ok((stored, replaced))
     }
 
     /// Get object metadata and file path for streaming by the handler.
@@ -348,7 +403,7 @@ impl Storage {
         if let Some(parent) = meta_path.parent() {
             fs::create_dir_all(parent)
                 .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                .map_err(super::path_conflict_error)?;
         }
         let json =
             serde_json::to_vec(metadata).map_err(|e| S3Error::InternalError(e.to_string()))?;
@@ -356,10 +411,13 @@ impl Storage {
         fs::write(&tmp_path, &json)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        if let Err(e) = crate::storage::rename_into(&tmp_path, &meta_path).await {
-            let _ = fs::remove_file(&tmp_path).await;
-            return Err(S3Error::InternalError(e.to_string()));
-        }
+        let replaced = file_size(&meta_path).await;
+        crate::storage::rename_into(&tmp_path, &meta_path)
+            .await
+            .map_err(super::path_conflict_error)?;
+        // Sidecars count toward the quota like the data they describe
+        self.quota.add(json.len() as u64);
+        self.quota.release(replaced);
         Ok(())
     }
 
@@ -408,7 +466,10 @@ impl Storage {
     pub async fn delete_object_metadata(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
         let meta_path = self.object_meta_path(bucket, key)?;
         if is_regular_file(&meta_path).await {
-            let _ = fs::remove_file(&meta_path).await;
+            let size = file_size(&meta_path).await;
+            if fs::remove_file(&meta_path).await.is_ok() {
+                self.quota.release(size);
+            }
             // Clean up empty parent directories up to .meta/
             let meta_root = self.data_dir.join(bucket).join(META_DIR);
             let mut current = meta_path.parent().map(|p| p.to_path_buf());
@@ -559,8 +620,10 @@ async fn collect_keys(
             continue;
         }
 
-        // Skip internal files and directories
-        if INTERNAL_NAMES.contains(&name.as_str()) {
+        // Skip internal files and directories. They only exist at the bucket
+        // root: deeper, the same names are ordinary user keys (`d/.meta`) and
+        // must stay visible in listings.
+        if current == base && INTERNAL_NAMES.contains(&name.as_str()) {
             continue;
         }
 
@@ -606,7 +669,9 @@ pub(crate) async fn stream_body_to_file(
     let mut reader = BodyReader::new(aws_chunked, check);
     let mut decoded = Vec::new();
     let mut total: u64 = 0;
-    let started = std::time::Instant::now();
+    let min_rate = min_upload_rate();
+    let mut window_start = std::time::Instant::now();
+    let mut window_bytes: u64 = 0;
 
     loop {
         // A client that stops sending must not hold its quota reservation forever
@@ -627,15 +692,15 @@ pub(crate) async fn stream_body_to_file(
         }
         reservation.ensure(total + payload.len() as u64)?;
         // A client trickling bytes would otherwise keep its whole up-front
-        // reservation (declared size) forever, blocking every other write
-        let elapsed = started.elapsed();
-        if elapsed > BODY_RATE_GRACE
-            && total
-                < elapsed
-                    .as_secs()
-                    .saturating_mul(BODY_MIN_RATE_BYTES_PER_SEC)
-        {
-            return Err(S3Error::RequestTimeout);
+        // reservation (declared size) forever, blocking every other write.
+        // Checked per 60 s window, so an early burst gives no credit.
+        window_bytes += payload.len() as u64;
+        if min_rate > 0 && window_start.elapsed() >= BODY_RATE_WINDOW {
+            if window_bytes < min_rate.saturating_mul(BODY_RATE_WINDOW.as_secs()) {
+                return Err(S3Error::RequestTimeout);
+            }
+            window_start = std::time::Instant::now();
+            window_bytes = 0;
         }
         md5_ctx.consume(payload);
         file.write_all(payload)
@@ -717,10 +782,21 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Uploads slower than `BODY_MIN_RATE_BYTES_PER_SEC` on average are aborted
-/// once `BODY_RATE_GRACE` has elapsed.
-const BODY_RATE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
-const BODY_MIN_RATE_BYTES_PER_SEC: u64 = 16 * 1024;
+/// Uploads that send less than `min_upload_rate()` bytes per second over a
+/// `BODY_RATE_WINDOW` are aborted.
+const BODY_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_MIN_UPLOAD_RATE: u64 = 4 * 1024;
+
+/// Minimum upload rate in bytes/s (`S3_MIN_UPLOAD_RATE`, 0 disables the check).
+fn min_upload_rate() -> u64 {
+    static RATE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        std::env::var("S3_MIN_UPLOAD_RATE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_MIN_UPLOAD_RATE)
+    })
+}
 
 /// Maximum time without receiving any body data before an upload is aborted.
 const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

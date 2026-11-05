@@ -19,6 +19,10 @@ use crate::xml;
 
 /// AWS S3 limit for user-defined metadata (sum of all key + value lengths).
 const MAX_USER_METADATA_BYTES: usize = 2048;
+/// Total size of the standard headers stored in the sidecar (content-type,
+/// cache-control, content-disposition, content-encoding, content-language,
+/// expires): bounds the per-object sidecar size.
+const MAX_SYSTEM_METADATA_BYTES: usize = 8192;
 
 /// Extract S3 metadata headers from the request.
 /// Returns `EntityTooLarge` if `x-amz-meta-*` headers exceed 2 KB in total.
@@ -37,7 +41,16 @@ fn extract_metadata(req: &Request<Incoming>) -> Result<StoredMetadata, S3Error> 
                 if meta_total > MAX_USER_METADATA_BYTES {
                     return Err(S3Error::EntityTooLarge);
                 }
-                user_metadata.insert(meta_key.to_string(), v.to_string());
+                // A repeated header would be stored with a value the
+                // signature does not cover (only the first one is signed)
+                if user_metadata
+                    .insert(meta_key.to_string(), v.to_string())
+                    .is_some()
+                {
+                    return Err(S3Error::InvalidArgument(format!(
+                        "Duplicate metadata header x-amz-meta-{meta_key}."
+                    )));
+                }
             }
         }
     }
@@ -60,13 +73,33 @@ fn extract_metadata(req: &Request<Incoming>) -> Result<StoredMetadata, S3Error> 
         })
         .filter(|v| !v.is_empty());
 
+    let content_type = get_header("content-type");
+    let cache_control = get_header("cache-control");
+    let content_disposition = get_header("content-disposition");
+    let content_language = get_header("content-language");
+    let expires = get_header("expires");
+    let system_total: usize = [
+        &content_type,
+        &cache_control,
+        &content_disposition,
+        &content_encoding,
+        &content_language,
+        &expires,
+    ]
+    .iter()
+    .map(|v| v.as_ref().map_or(0, |s| s.len()))
+    .sum();
+    if system_total > MAX_SYSTEM_METADATA_BYTES {
+        return Err(S3Error::EntityTooLarge);
+    }
+
     Ok(StoredMetadata {
-        content_type: get_header("content-type"),
-        cache_control: get_header("cache-control"),
-        content_disposition: get_header("content-disposition"),
+        content_type,
+        cache_control,
+        content_disposition,
         content_encoding,
-        content_language: get_header("content-language"),
-        expires: get_header("expires"),
+        content_language,
+        expires,
         user_metadata,
         encryption: None,
         etag: None,
@@ -326,6 +359,7 @@ pub async fn put_object(
             aws_chunked,
             check,
             encrypt.as_ref(),
+            metadata,
             reservation,
         )
         .await
@@ -333,16 +367,6 @@ pub async fn put_object(
         Ok(r) => r,
         Err(e) => return error_response(e, &resource),
     };
-
-    // Store encryption metadata and plaintext ETag
-    metadata.encryption = encryption_meta.clone();
-    // Stored for every object: listings and HEAD never re-read the data
-    metadata.etag = Some(etag.clone());
-
-    // Persist object metadata sidecar
-    if let Err(e) = storage.put_object_metadata(bucket, key, &metadata).await {
-        return error_response(e, &resource);
-    }
 
     // Check versioning status and store version if needed
     let versioning = storage
@@ -1247,20 +1271,6 @@ pub async fn copy_object(
         None => None,
     };
 
-    // Atomic rename to destination
-    {
-        let _path_guard = storage.quota.lock_path(&dst_path).await;
-        let copied = crate::quota::file_size(&tmp_path).await;
-        let replaced = crate::quota::file_size(&dst_path).await;
-        if let Err(e) = crate::storage::rename_into(&tmp_path, &dst_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return error_response(S3Error::InternalError(e.to_string()), &resource);
-        }
-        // With versioning, the factor-2 reservation covers the version copy
-        reservation.commit(copied);
-        storage.quota.release(replaced);
-    }
-
     // Build destination metadata
     let mut dst_metadata = if let Some(ref meta) = override_metadata {
         meta.clone()
@@ -1271,14 +1281,22 @@ pub async fn copy_object(
         m.etag = None;
         m
     };
-
     dst_metadata.encryption = dst_enc_meta.clone();
     dst_metadata.etag = Some(etag.clone());
     dst_metadata.owner = owner.map(|s| s.to_string());
 
-    let _ = storage
-        .put_object_metadata(bucket, key, &dst_metadata)
-        .await;
+    // Publish data and sidecar together (sidecar first)
+    match storage
+        .publish_object(bucket, key, &dst_path, &tmp_path, &dst_metadata)
+        .await
+    {
+        Ok((copied, replaced)) => {
+            // With versioning, the factor-2 reservation covers the version copy
+            reservation.commit(copied);
+            storage.quota.release(replaced);
+        }
+        Err(e) => return error_response(e, &resource),
+    }
 
     let file_meta = match tokio::fs::symlink_metadata(&dst_path).await {
         Ok(m) => m,

@@ -239,25 +239,10 @@ pub async fn complete_multipart_upload(
     };
 
     match storage
-        .complete_multipart_upload(bucket, upload_id, parts, encrypt.as_ref())
+        .complete_multipart_upload(bucket, upload_id, parts, encrypt.as_ref(), owner)
         .await
     {
-        Ok((completed_key, etag, encryption_meta)) => {
-            // Fresh sidecar for the new object: never inherit the encryption
-            // parameters, ETag or metadata of the object it replaces
-            let stored = crate::storage::object::StoredMetadata {
-                owner: owner.map(|s| s.to_string()),
-                etag: Some(etag.clone()),
-                encryption: encryption_meta,
-                ..Default::default()
-            };
-            if let Err(e) = storage
-                .put_object_metadata(bucket, &completed_key, &stored)
-                .await
-            {
-                return error_response(e, &resource);
-            }
-
+        Ok((completed_key, etag, _encryption_meta)) => {
             let result = xml::CompleteMultipartUploadResult {
                 xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
                 location: format!("/{}/{}", bucket, completed_key),

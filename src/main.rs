@@ -360,6 +360,14 @@ async fn run() {
     if stale_count > 0 {
         eprintln!("Removed {stale_count} stale temporary file(s) ({stale_bytes} bytes)");
     }
+    if s3::storage::is_case_insensitive(&storage.data_dir) {
+        eprintln!(
+            "WARNING: the data directory is on a case-insensitive filesystem (macOS, Windows, \
+             Docker Desktop bind mount). Object keys that differ only by case share one file, \
+             and bucket policies match keys case-sensitively, so a Deny on 'secret/*' does not \
+             cover 'Secret/x'. Use a case-sensitive filesystem in production."
+        );
+    }
 
     // Create S3_INIT_BUCKETS (owned by the root user) when they do not exist yet
     if !cfg.init_buckets.is_empty() {

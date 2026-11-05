@@ -151,6 +151,7 @@ All configuration is done via environment variables. No configuration file is re
 | `S3_SHUTDOWN_GRACE` | `8` | Seconds granted to in-flight requests after `SIGTERM`/`SIGINT` |
 | `S3_MAX_BLOCKING_THREADS` | `32` | Cap on the blocking thread pool used for file I/O (keep below the container PID limit) |
 | `S3_MAX_CONNECTIONS` | `1024` | Maximum concurrent client connections; extra connections are closed right after accept |
+| `S3_MIN_UPLOAD_RATE` | `4096` | Minimum upload rate in bytes/s over any 60 s window (slower uploads are aborted, releasing their quota reservation); `0` disables |
 
 **Notes:**
 

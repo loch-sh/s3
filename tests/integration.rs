@@ -5634,7 +5634,7 @@ async fn test_quota_put_object_and_delete_frees_space() {
         .unwrap();
     assert_eq!(resp.status(), 404);
     assert_eq!(count_tmp_files(&tmp_dir), 0);
-    assert_eq!(used_bytes(&client, &base_url).await, 600);
+    assert_near(used_bytes(&client, &base_url).await, 600); // + sidecars
 
     // Deleting frees space immediately
     let resp = client
@@ -5661,7 +5661,7 @@ async fn test_quota_put_object_and_delete_frees_space() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(used_bytes(&client, &base_url).await, 300);
+    assert_near(used_bytes(&client, &base_url).await, 300); // + sidecars
 
     cleanup(&tmp_dir);
 }
@@ -5700,7 +5700,7 @@ async fn test_quota_concurrent_uploads_cannot_exceed_limit() {
     assert_eq!(ok, 3);
 
     let used = used_bytes(&client, &base_url).await;
-    assert_eq!(used, 900_000);
+    assert_near(used, 900_000); // + sidecars
     assert!(used <= limit);
     assert_eq!(count_tmp_files(&tmp_dir), 0);
 
@@ -5907,7 +5907,7 @@ async fn test_quota_copy_object() {
         .await
         .unwrap();
     assert_quota_exceeded(resp).await;
-    assert_eq!(used_bytes(&client, &base_url).await, 600);
+    assert_near(used_bytes(&client, &base_url).await, 600); // + sidecars
     assert_eq!(count_tmp_files(&tmp_dir), 0);
 
     cleanup(&tmp_dir);
@@ -5963,7 +5963,7 @@ async fn test_quota_initialized_from_existing_data() {
 
     let base_url = start_server_with_quota_in(tmp_dir.clone(), Some(1000), None).await;
     let client = reqwest::Client::new();
-    assert_eq!(used_bytes(&client, &base_url).await, 700);
+    assert_near(used_bytes(&client, &base_url).await, 700); // + sidecars
 
     let resp = client
         .put(format!("{}/existing-bucket/new", base_url))
@@ -8819,6 +8819,484 @@ async fn test_sse_truncated_ciphertext_is_not_copied() {
     assert!(
         r.bytes().await.is_err(),
         "truncated body must surface as an error"
+    );
+    cleanup(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 1.4.1: findings from the independent review (verified)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_security_directory_marker_has_its_own_versions() {
+    use reqwest::Method;
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    setup_alice_and_bob(&client, &base_url).await;
+    let enable = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "versioning=",
+        enable,
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b/pub",
+        "",
+        b"PRIVATE-v1",
+        &[],
+        ALICE,
+    )
+    .await;
+    let vid = r
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    // bob may only touch alice-b/pub/*
+    let policy = br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:loch:iam:::user/bob"},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:loch:s3:::alice-b/pub/*"}]}"#;
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b",
+        "policy=",
+        policy,
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 204);
+
+    // The marker key "pub/" must not reach the versions of key "pub"
+    let q = format!("versionId={vid}");
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/alice-b/pub/",
+        &q,
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_ne!(r.status(), 200);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::DELETE,
+        "/alice-b/pub/",
+        &q,
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_ne!(r.status(), 204);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::DELETE,
+        "/alice-b/pub/",
+        "",
+        b"",
+        &[],
+        BOB,
+    )
+    .await;
+    assert_eq!(r.status(), 204);
+    // alice's key "pub" is untouched
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/alice-b/pub",
+        "",
+        b"",
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "PRIVATE-v1");
+    let r = signed(
+        &client,
+        &base_url,
+        Method::GET,
+        "/alice-b/pub",
+        &q,
+        b"",
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_sidecar_collision_publishes_nothing() {
+    let tmp = std::env::temp_dir().join(format!("s3-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let base = start_server_in_dir(&tmp, by_default_config()).await;
+    let client = reqwest::Client::new();
+    client.put(format!("{base}/coll")).send().await.unwrap();
+    // "k" owns the sidecar file .meta/k.json; "k.json/x" needs it as a directory
+    let r = client
+        .put(format!("{base}/coll/k"))
+        .body("first")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = client
+        .put(format!("{base}/coll/k.json/x"))
+        .body("second")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "layout conflict is a client error");
+    let r = client
+        .get(format!("{base}/coll/k.json/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "nothing published without its sidecar");
+    assert!(!tmp.join("coll/k.json").exists());
+    let r = client.get(format!("{base}/coll/k")).send().await.unwrap();
+    assert_eq!(r.text().await.unwrap(), "first");
+    // No temporary file left behind
+    let leftovers = std::fs::read_dir(tmp.join(".loch-tmp"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(leftovers, 0);
+    cleanup(&tmp);
+}
+
+#[tokio::test]
+async fn test_security_presigned_url_rejects_unsigned_amz_headers() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    setup_alice_and_bob(&client, &base_url).await;
+    let host = base_url.trim_start_matches("http://");
+    let url = sign_presigned_url(
+        &base_url,
+        "PUT",
+        "/alice-b/up.txt",
+        host,
+        300,
+        ALICE.0,
+        ALICE.1,
+    );
+    for (h, v) in [("x-amz-acl", "public-read"), ("x-amz-meta-evil", "1")] {
+        let r = client
+            .put(&url)
+            .header(h, v)
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "unsigned {h} must be refused");
+    }
+    let r = client.put(&url).body("x").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_cancelled_complete_can_be_retried() {
+    use tokio::io::AsyncWriteExt;
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/mp-cancel"))
+        .send()
+        .await
+        .unwrap();
+    let r = client
+        .post(format!("{base_url}/mp-cancel/big?uploads"))
+        .send()
+        .await
+        .unwrap();
+    let upload_id = extract_xml_value(&r.text().await.unwrap(), "UploadId");
+    let mut parts = String::new();
+    for n in 1..=3 {
+        let r = client
+            .put(format!(
+                "{base_url}/mp-cancel/big?partNumber={n}&uploadId={upload_id}"
+            ))
+            .body(vec![n as u8; 8 * 1024 * 1024])
+            .send()
+            .await
+            .unwrap();
+        let etag = r
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        parts.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    let body = format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>");
+
+    // Send Complete and drop the connection right away
+    let addr = base_url.trim_start_matches("http://");
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "POST /mp-cancel/big?uploadId={upload_id} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    drop(s);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The retry succeeds (or finds the object already completed)
+    let r = client
+        .post(format!("{base_url}/mp-cancel/big?uploadId={upload_id}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let completed = r.status() == 200;
+    let r = client
+        .head(format!("{base_url}/mp-cancel/big"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        completed || r.status() == 200,
+        "upload stuck after a cancelled Complete"
+    );
+    assert_eq!(r.headers().get("content-length").unwrap(), "25165824");
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_quota_counts_sidecars_and_caps_system_headers() {
+    let (base_url, tmp_dir) = start_server_with_quota(Some(1_000_000)).await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/meta-q"))
+        .send()
+        .await
+        .unwrap();
+    let big = "x".repeat(9000);
+    let r = client
+        .put(format!("{base_url}/meta-q/a"))
+        .header("cache-control", &big)
+        .body("")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 413);
+    let r = client
+        .put(format!("{base_url}/meta-q/b"))
+        .header("content-disposition", "x".repeat(4000))
+        .body("")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // The sidecar is counted right away
+    assert!(used_bytes(&client, &base_url).await >= 4000);
+    client
+        .delete(format!("{base_url}/meta-q/b"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(used_bytes(&client, &base_url).await, 0);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_security_policy_actions_wildcards_and_validation() {
+    use reqwest::Method;
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    setup_alice_and_bob(&client, &base_url).await;
+    // Unknown service / malformed action: rejected
+    for action in [r#""iam:*""#, r#""s3:Get Object""#, r#""""#] {
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"*","Action":{action},"Resource":"arn:loch:s3:::alice-b/*"}}]}}"#
+        );
+        let r = signed(
+            &client,
+            &base_url,
+            Method::PUT,
+            "/alice-b",
+            "policy=",
+            policy.as_bytes(),
+            &[],
+            ALICE,
+        )
+        .await;
+        assert_eq!(r.status(), 400, "{action}");
+    }
+    // AWS-style wildcards and case: each Deny applies
+    for deny in [r#""*""#, r#""s3:Get*""#, r#""s3:getobject""#] {
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[
+            {{"Effect":"Allow","Principal":{{"AWS":"arn:loch:iam:::user/bob"}},"Action":"s3:GetObject","Resource":"arn:loch:s3:::alice-b/*"}},
+            {{"Effect":"Deny","Principal":{{"AWS":"arn:loch:iam:::user/bob"}},"Action":{deny},"Resource":"arn:loch:s3:::alice-b/secret.txt"}}]}}"#
+        );
+        let r = signed(
+            &client,
+            &base_url,
+            Method::PUT,
+            "/alice-b",
+            "policy=",
+            policy.as_bytes(),
+            &[],
+            ALICE,
+        )
+        .await;
+        assert_eq!(r.status(), 204, "{deny}");
+        let r = signed(
+            &client,
+            &base_url,
+            Method::GET,
+            "/alice-b/secret.txt",
+            "",
+            b"",
+            &[],
+            BOB,
+        )
+        .await;
+        assert_eq!(r.status(), 403, "Deny {deny} must apply");
+    }
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_security_overwrite_resets_object_acl() {
+    let (base_url, tmp_dir) = start_multi_user_server().await;
+    let client = reqwest::Client::new();
+    setup_alice_and_bob(&client, &base_url).await;
+    use reqwest::Method;
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b/doc",
+        "",
+        b"public v1",
+        &[],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b/doc",
+        "acl=",
+        b"",
+        &[("x-amz-acl", "public-read")],
+        ALICE,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = client
+        .get(format!("{base_url}/alice-b/doc"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // A new object starts private
+    signed(
+        &client,
+        &base_url,
+        Method::PUT,
+        "/alice-b/doc",
+        "",
+        b"private v2",
+        &[],
+        ALICE,
+    )
+    .await;
+    let r = client
+        .get(format!("{base_url}/alice-b/doc"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_nested_internal_names_are_listed() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/nested-int"))
+        .send()
+        .await
+        .unwrap();
+    for key in ["d/.meta", "in/.policy.json", "x/.versions/y"] {
+        let r = client
+            .put(format!("{base_url}/nested-int/{key}"))
+            .body("v")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{key}");
+    }
+    let body = client
+        .get(format!("{base_url}/nested-int?list-type=2"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for key in ["d/.meta", "in/.policy.json", "x/.versions/y"] {
+        assert!(
+            body.contains(&format!("<Key>{key}</Key>")),
+            "{key} missing: {body}"
+        );
+    }
+    cleanup(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_security_internal_names_rejected_in_any_case() {
+    let (base_url, tmp_dir) = start_server().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base_url}/case-int"))
+        .send()
+        .await
+        .unwrap();
+    let before = std::fs::read(tmp_dir.join("case-int/.metadata")).unwrap();
+    for key in [".METADATA", ".Policy.Json", ".META/x.json"] {
+        let r = client
+            .put(format!("{base_url}/case-int/{key}"))
+            .body(r#"{"owner":"mallory"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "{key}");
+    }
+    assert_eq!(
+        std::fs::read(tmp_dir.join("case-int/.metadata")).unwrap(),
+        before
     );
     cleanup(&tmp_dir);
 }

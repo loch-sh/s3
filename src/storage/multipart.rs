@@ -41,9 +41,6 @@ pub struct UploadInfo {
 
 const UPLOADS_DIR: &str = ".uploads";
 const META_FILE: &str = ".meta.json";
-/// Created atomically by CompleteMultipartUpload: one completion at a time
-/// per upload (each one assembles a full-size temporary copy).
-const COMPLETING_FILE: &str = ".completing";
 
 /// An upload ID is valid only in the canonical hyphenated lowercase UUID form.
 pub(crate) fn is_valid_upload_id(upload_id: &str) -> bool {
@@ -208,6 +205,7 @@ impl Storage {
         upload_id: &str,
         parts: Vec<(u32, String)>,
         encrypt: Option<&crate::encryption::EncryptRequest>,
+        owner: Option<&str>,
     ) -> Result<(String, String, Option<crate::encryption::EncryptionMeta>), S3Error> {
         self.head_bucket(bucket).await?;
 
@@ -243,25 +241,23 @@ impl Storage {
                 .map_err(|e| S3Error::InternalError(e.to_string()))?;
         }
 
-        // Only one completion at a time per upload; the marker disappears
-        // with the upload directory on success and is removed on failure.
-        let completing = upload_dir.join(COMPLETING_FILE);
-        if fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&completing)
-            .await
-            .is_err()
-        {
+        // Only one completion at a time per upload (each assembles a full
+        // copy). The claim is released when the guard drops, even if the
+        // client disconnects and the request is cancelled.
+        let Some(_completion) = self.begin_completion(upload_id) else {
             return Err(S3Error::NoSuchUpload);
-        }
-        let result = self
-            .assemble_upload(bucket, upload_id, &object_path, parts, encrypt)
-            .await;
-        if result.is_err() {
-            let _ = fs::remove_file(&completing).await;
-        }
-        let (composite_etag, encryption) = result?;
+        };
+        let (composite_etag, encryption) = self
+            .assemble_upload(
+                bucket,
+                upload_id,
+                &meta.key,
+                &object_path,
+                parts,
+                encrypt,
+                owner,
+            )
+            .await?;
 
         // Clean up upload directory
         let _ = self.remove_upload_dir(&upload_dir).await;
@@ -275,9 +271,11 @@ impl Storage {
         &self,
         bucket: &str,
         upload_id: &str,
+        key: &str,
         object_path: &std::path::Path,
         parts: Vec<(u32, String)>,
         encrypt: Option<&crate::encryption::EncryptRequest>,
+        owner: Option<&str>,
     ) -> Result<(String, Option<crate::encryption::EncryptionMeta>), S3Error> {
         // Temporary file for atomic assembly
         let tmp_path = self.tmp_file();
@@ -350,22 +348,25 @@ impl Storage {
             None => None,
         };
 
-        // Atomic rename. Parts are already counted in the quota, so assembling
-        // them is space-neutral once the upload directory is removed below.
-        {
-            let _path_guard = self.quota.lock_path(object_path).await;
-            let assembled = file_size(&tmp_path).await;
-            let replaced = file_size(object_path).await;
-            if let Err(e) = crate::storage::rename_into(&tmp_path, object_path).await {
-                let _ = fs::remove_file(&tmp_path).await;
-                return Err(S3Error::InternalError(e.to_string()));
-            }
-            self.quota.add(assembled);
-            self.quota.release(replaced);
-        }
-
         // S3-style multipart ETag: md5_of_concatenated_part_md5s-part_count
         let composite_etag = format!("\"{:x}-{}\"", md5_of_md5s.finalize(), part_count);
+
+        // Fresh sidecar for the new object: never inherit the encryption
+        // parameters, ETag or metadata of the object it replaces
+        let metadata = crate::storage::object::StoredMetadata {
+            owner: owner.map(|s| s.to_string()),
+            etag: Some(composite_etag.clone()),
+            encryption: encryption.clone(),
+            ..Default::default()
+        };
+        // Publish data and sidecar together. Parts are already counted in the
+        // quota, so assembling them is space-neutral once the upload
+        // directory is removed.
+        let (assembled, replaced) = self
+            .publish_object(bucket, key, object_path, &tmp_path, &metadata)
+            .await?;
+        self.quota.add(assembled);
+        self.quota.release(replaced);
 
         Ok((composite_etag, encryption))
     }
@@ -435,7 +436,7 @@ impl Storage {
             .map_err(|e| S3Error::InternalError(e.to_string()))?
         {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == META_FILE || name == COMPLETING_FILE || name.ends_with("tmp") {
+            if name == META_FILE || name.ends_with("tmp") {
                 continue;
             }
             if let Ok(part_number) = name.parse::<u32>() {

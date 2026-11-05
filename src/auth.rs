@@ -108,9 +108,9 @@ fn payload_check_for(
     }
 }
 
-/// Header auth: `host` and every `x-amz-*` header sent must be signed,
-/// otherwise a captured signature could be replayed with added headers
-/// (metadata, ACL, SSE, content type...).
+/// `host` and every `x-amz-*` header sent must be signed (header auth and
+/// presigned URLs), otherwise a captured signature or a leaked URL could be
+/// used with added headers (metadata, ACL, SSE...).
 fn check_signed_headers(req: &Request<Incoming>, signed: &[&str]) -> Result<(), S3Error> {
     let is_signed = |name: &str| signed.iter().any(|s| s.eq_ignore_ascii_case(name));
     if !is_signed("host") {
@@ -310,12 +310,9 @@ fn verify_presigned(
     // Canonical query: all params sorted, excluding X-Amz-Signature
     let canonical_query = canonical_query_string(query, Some("X-Amz-Signature"));
     let signed_headers: Vec<&str> = signed_headers_param.split(';').collect();
-    if !signed_headers
-        .iter()
-        .any(|h| h.eq_ignore_ascii_case("host"))
-    {
-        return Err(S3Error::AccessDenied);
-    }
+    // Same rule as header auth (and AWS): a leaked URL must not let its
+    // holder add unsigned x-amz-* headers (ACL, SSE-C, metadata...)
+    check_signed_headers(req, &signed_headers)?;
     let canonical_req =
         build_canonical_request(req, &signed_headers, &canonical_query, "UNSIGNED-PAYLOAD");
     let canonical_req_hash = sha256_hex(canonical_req.as_bytes());

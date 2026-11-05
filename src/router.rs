@@ -130,6 +130,7 @@ pub async fn route(
         has_key,
         is_management_request,
         is_presigned,
+        version_id.is_some() || is_versions_request,
     )
     .await
     {
@@ -418,6 +419,7 @@ async fn check_auth(
     has_key: bool,
     is_management_request: bool,
     is_presigned: bool,
+    versioned: bool,
 ) -> Option<Response<BoxBody>> {
     // No user store configured: open access
     if config.user_store.is_none() {
@@ -464,7 +466,7 @@ async fn check_auth(
             }
 
             // For data endpoints, check bucket policy for this user
-            let action = determine_action(method, has_key);
+            let action = determine_action(method, has_key, versioned);
             if let Some(action) = action {
                 let user_arn = UserStore::arn_for(&user.user_id);
                 if check_user_access(storage, bucket, key, action, &user_arn).await {
@@ -497,7 +499,7 @@ async fn check_auth(
             }
 
             // For data endpoints, check bucket policy and ACLs for anonymous access
-            let action = determine_action(method, has_key);
+            let action = determine_action(method, has_key, versioned);
             let allowed = if let Some(action) = action {
                 anonymous_allowed(storage, bucket, key, has_key, method, action).await
             } else {
@@ -533,7 +535,12 @@ async fn authorize_copy_source(
     let deny = || Some(handlers::error_response(S3Error::AccessDenied, path));
 
     // Malformed sources are rejected by the handler (no data is read)
-    let (src_bucket, src_key, _version_id) = handlers::object::parse_copy_source(copy_source)?;
+    let (src_bucket, src_key, src_version) = handlers::object::parse_copy_source(copy_source)?;
+    let src_action = if src_version.is_some() {
+        S3Action::GetObjectVersion
+    } else {
+        S3Action::GetObject
+    };
     if crate::storage::validate_bucket_name(&src_bucket).is_err() {
         return deny();
     }
@@ -553,15 +560,7 @@ async fn authorize_copy_source(
                 Err(e) => return Some(handlers::error_response(e, path)),
             }
             let user_arn = UserStore::arn_for(&user.user_id);
-            if check_user_access(
-                storage,
-                &src_bucket,
-                &src_key,
-                S3Action::GetObject,
-                &user_arn,
-            )
-            .await
-            {
+            if check_user_access(storage, &src_bucket, &src_key, src_action, &user_arn).await {
                 None
             } else {
                 deny()
@@ -577,7 +576,7 @@ async fn authorize_copy_source(
                 &src_key,
                 true,
                 &Method::GET,
-                S3Action::GetObject,
+                src_action,
             )
             .await;
             if allowed { None } else { deny() }
@@ -705,11 +704,18 @@ async fn route_multipart(
 }
 
 /// Determine the S3 action for the current request.
-fn determine_action(method: &Method, has_key: bool) -> Option<S3Action> {
+/// `versioned`: the request carries `versionId` (object) or `versions`
+/// (bucket listing), which maps to the version-specific policy actions.
+fn determine_action(method: &Method, has_key: bool, versioned: bool) -> Option<S3Action> {
     match (method, has_key) {
+        (&Method::GET, true) | (&Method::HEAD, true) if versioned => {
+            Some(S3Action::GetObjectVersion)
+        }
         (&Method::GET, true) | (&Method::HEAD, true) => Some(S3Action::GetObject),
         (&Method::PUT, true) | (&Method::POST, true) => Some(S3Action::PutObject),
+        (&Method::DELETE, true) if versioned => Some(S3Action::DeleteObjectVersion),
         (&Method::DELETE, true) => Some(S3Action::DeleteObject),
+        (&Method::GET, false) if versioned => Some(S3Action::ListBucketVersions),
         (&Method::GET, false) => Some(S3Action::ListBucket),
         (&Method::HEAD, false) => Some(S3Action::GetBucketLocation),
         _ => None,
@@ -999,7 +1005,7 @@ async fn resolve_acl_put(
     if let Some(canned) = canned_acl {
         Ok(canned_acl_xml(&canned))
     } else {
-        match read_body_limited(req, 64 * 1024).await {
+        match read_body_limited(req, 16 * 1024).await {
             Ok(body) if !body.is_empty() => Ok(String::from_utf8_lossy(&body).to_string()),
             Ok(_) => Ok(default_acl_xml()),
             Err(e) => Err(handlers::error_response(e, resource)),

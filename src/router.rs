@@ -22,18 +22,23 @@ pub async fn route(
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
-    // Log incoming request
-    let uri = if query.is_empty() {
-        path.clone()
-    } else {
-        format!("{}?{}", path, query)
-    };
-    eprintln!("--> {} {}", method, uri);
-    for (name, value) in req.headers() {
-        if let Ok(v) = value.to_str() {
-            eprintln!("    {}: {}", name, v);
-        }
+    // Health probe: no auth, not logged (polled by container healthchecks)
+    if path == "/_loch/health" {
+        return Ok(handlers::health::health(&method, &config).await);
     }
+
+    // Storage usage (root only)
+    if path == "/_loch/usage" {
+        let response = handlers::health::usage(&req, &config).await;
+        eprintln!("<-- {} {}", response.status().as_u16(), path);
+        return Ok(response);
+    }
+
+    // Log incoming request: method and path only. Headers and the query string
+    // are never logged: they carry credentials (Authorization, Bearer admin key,
+    // SSE-C customer keys, presigned X-Amz-Signature).
+    let uri = path.clone();
+    eprintln!("--> {} {}", method, uri);
     let origin = req
         .headers()
         .get("origin")
@@ -72,8 +77,11 @@ pub async fn route(
     let is_encryption_request = query_params.contains_key("encryption");
     let is_acl_write = is_acl_request && method == Method::PUT;
     let is_versioning_write = is_versioning_request && method == Method::PUT;
-    let is_management_request =
-        is_policy_request || is_cors_request || is_encryption_request || is_acl_write || is_versioning_write;
+    let is_management_request = is_policy_request
+        || is_cors_request
+        || is_encryption_request
+        || is_acl_write
+        || is_versioning_write;
 
     // Handle OPTIONS preflight (no auth required)
     if method == Method::OPTIONS && has_bucket {
@@ -315,46 +323,17 @@ pub async fn route(
             if let Some(copy_source) = req.headers().get("x-amz-copy-source") {
                 let source = copy_source.to_str().unwrap_or("").to_string();
 
-                // If the request is anonymous (auth failed, but destination bucket policy
-                // allowed the PUT), also verify that the source bucket/key allows anonymous
-                // GET. Without this check, an anonymous user could copy private objects into
-                // a world-writable bucket.
-                if config.user_store.is_some() && !matches!(&auth_result, Ok(Some(_))) {
-                    let src = source.trim_start_matches('/');
-                    let src_path = src.split('?').next().unwrap_or(src);
-                    if let Some(sep) = src_path.find('/') {
-                        let src_bucket = &src_path[..sep];
-                        let src_key = &src_path[sep + 1..];
-                        let policy_ok = check_anonymous_access(
-                            &storage,
-                            src_bucket,
-                            src_key,
-                            S3Action::GetObject,
-                        )
-                        .await;
-                        let acl_ok = check_acl_anonymous(
-                            &storage,
-                            src_bucket,
-                            src_key,
-                            true,
-                            &Method::GET,
-                        )
-                        .await;
-                        if !policy_ok && !acl_ok {
-                            let path = format!("/{}/{}", bucket, key);
-                            let deny = handlers::error_response(S3Error::AccessDenied, &path);
-                            let response = maybe_add_cors_headers(
-                                deny,
-                                &storage,
-                                &bucket,
-                                &method,
-                                origin.as_deref(),
-                            )
+                // The caller must be allowed to read the source, exactly as for a direct GET
+                // (check_auth above only covered the destination).
+                if let Some(deny) =
+                    authorize_copy_source(&auth_result, &config, &storage, &req, &source, &path)
+                        .await
+                {
+                    let response =
+                        maybe_add_cors_headers(deny, &storage, &bucket, &method, origin.as_deref())
                             .await;
-                            eprintln!("<-- 403 {}", uri);
-                            return Ok(response);
-                        }
-                    }
+                    eprintln!("<-- {} {}", response.status().as_u16(), uri);
+                    return Ok(response);
                 }
 
                 handlers::object::copy_object(
@@ -519,6 +498,73 @@ async fn check_auth(
             } else {
                 None
             }
+        }
+    }
+}
+
+/// Authorize the source of a CopyObject: the caller needs GetObject on the source
+/// (root, source bucket owner, bucket policy, or anonymous policy/ACL), with or
+/// without `versionId`. For signed requests, `x-amz-copy-source` must be one of
+/// the signed headers, so a presigned PUT URL cannot be turned into a copy.
+/// Returns Some(response) if the copy must be denied.
+async fn authorize_copy_source(
+    auth_result: &Result<Option<AuthenticatedUser>, S3Error>,
+    config: &ServerConfig,
+    storage: &Storage,
+    req: &Request<Incoming>,
+    copy_source: &str,
+    path: &str,
+) -> Option<Response<BoxBody>> {
+    // No user store configured: open access
+    if config.user_store.is_none() {
+        return None;
+    }
+    let deny = || Some(handlers::error_response(S3Error::AccessDenied, path));
+
+    // Malformed sources are rejected by the handler (no data is read)
+    let (src_bucket, src_key, _version_id) = handlers::object::parse_copy_source(copy_source)?;
+    if crate::storage::validate_bucket_name(&src_bucket).is_err() {
+        return deny();
+    }
+
+    match auth_result {
+        Ok(Some(user)) => {
+            let signed = auth::signed_header_names(req);
+            if !signed.iter().any(|h| h == "x-amz-copy-source") {
+                return deny();
+            }
+            if user.is_root {
+                return None;
+            }
+            match storage.get_bucket_owner(&src_bucket).await {
+                Ok(owner) if owner.as_deref() == Some(user.user_id.as_str()) => return None,
+                Ok(_) => {}
+                Err(e) => return Some(handlers::error_response(e, path)),
+            }
+            let user_arn = UserStore::arn_for(&user.user_id);
+            if check_user_access(
+                storage,
+                &src_bucket,
+                &src_key,
+                S3Action::GetObject,
+                &user_arn,
+            )
+            .await
+            {
+                None
+            } else {
+                deny()
+            }
+        }
+        Ok(None) => deny(),
+        // Anonymous request whose destination PUT was allowed by policy/ACL:
+        // the source must allow anonymous GET too.
+        Err(_) => {
+            let policy_ok =
+                check_anonymous_access(storage, &src_bucket, &src_key, S3Action::GetObject).await;
+            let acl_ok =
+                check_acl_anonymous(storage, &src_bucket, &src_key, true, &Method::GET).await;
+            if policy_ok || acl_ok { None } else { deny() }
         }
     }
 }
@@ -736,7 +782,7 @@ fn acl_grants_to_all_users(acl_xml: &[u8], needed: &str) -> bool {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e)) => {
                 let name = e.name();
-                let local = local_name(name.as_ref());
+                let local = local_name(name.as_ref().as_bytes());
                 match local {
                     b"Grant" => {
                         in_grant = true;
@@ -751,7 +797,7 @@ fn acl_grants_to_all_users(acl_xml: &[u8], needed: &str) -> bool {
             }
             Ok(quick_xml::events::Event::End(ref e)) => {
                 let name = e.name();
-                let local = local_name(name.as_ref());
+                let local = local_name(name.as_ref().as_bytes());
                 match local {
                     b"Grant" => {
                         if is_all_users
@@ -769,13 +815,11 @@ fn acl_grants_to_all_users(acl_xml: &[u8], needed: &str) -> bool {
                 }
             }
             Ok(quick_xml::events::Event::Text(ref e)) => {
-                if let Ok(text) = e.decode() {
-                    let text = text.trim();
-                    if in_uri && text == ALL_USERS_URI {
-                        is_all_users = true;
-                    } else if in_permission {
-                        current_permission = text.to_string();
-                    }
+                let text = AsRef::<str>::as_ref(e).trim();
+                if in_uri && text == ALL_USERS_URI {
+                    is_all_users = true;
+                } else if in_permission {
+                    current_permission = text.to_string();
                 }
             }
             Ok(quick_xml::events::Event::Eof) => break,

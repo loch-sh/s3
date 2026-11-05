@@ -4,6 +4,7 @@ use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use super::{BoxBody, empty_response, error_response, full_body, xml_response};
@@ -293,10 +294,23 @@ pub async fn put_object(
         Err(e) => return error_response(e, &resource),
     };
     metadata.owner = owner.map(|s| s.to_string());
+
+    // Reserve quota up front for the declared size (fail fast), then per chunk while streaming.
+    // Versioned buckets keep a second copy of the object (stored below by
+    // store_version_and_respond), hence a factor of 2.
+    let versioned = is_versioned(storage, bucket).await;
+    let mut reservation = storage.quota.reservation(if versioned { 2 } else { 1 });
+    let declared = declared_payload_length(&req).unwrap_or(0);
+    if let Err(e) = reservation.ensure(declared) {
+        return error_response(e, &resource);
+    }
     let body = req.into_body();
 
     // Stream body to disk (plaintext) with MD5
-    let etag = match storage.put_object(bucket, key, body, aws_chunked).await {
+    let etag = match storage
+        .put_object(bucket, key, body, aws_chunked, reservation)
+        .await
+    {
         Ok(etag) => etag,
         Err(e) => return error_response(e, &resource),
     };
@@ -310,7 +324,13 @@ pub async fn put_object(
                 Ok(p) => p,
                 Err(e) => return error_response(e, &resource),
             };
-            match encryption::encrypt_sse_s3(&object_path, &enc_config.master_key).await {
+            match encryption::encrypt_sse_s3(
+                &object_path,
+                &storage.tmp_file(),
+                &enc_config.master_key,
+            )
+            .await
+            {
                 Ok(meta) => Some(meta),
                 Err(e) => return error_response(e, &resource),
             }
@@ -323,7 +343,9 @@ pub async fn put_object(
                 Ok(p) => p,
                 Err(e) => return error_response(e, &resource),
             };
-            match encryption::encrypt_sse_c(&object_path, cust_key, key_md5).await {
+            match encryption::encrypt_sse_c(&object_path, &storage.tmp_file(), cust_key, key_md5)
+                .await
+            {
                 Ok(meta) => Some(meta),
                 Err(e) => return error_response(e, &resource),
             }
@@ -357,6 +379,30 @@ pub async fn put_object(
             builder.body(full_body(bytes::Bytes::new())).unwrap()
         }
     }
+}
+
+/// Whether the bucket keeps object versions (Enabled or Suspended): writes then
+/// produce a second on-disk copy under `.versions/`. An unreadable versioning
+/// configuration counts as versioned, so the quota reservation errs on the safe side.
+pub(crate) async fn is_versioned(storage: &Storage, bucket: &str) -> bool {
+    !matches!(
+        storage.get_versioning(bucket).await,
+        Ok(VersioningStatus::Unversioned)
+    )
+}
+
+/// Payload size declared by the client, if any: `x-amz-decoded-content-length`
+/// for aws-chunked bodies, `Content-Length` otherwise.
+pub(crate) fn declared_payload_length(req: &Request<Incoming>) -> Option<u64> {
+    let header = if is_aws_chunked(req) {
+        "x-amz-decoded-content-length"
+    } else {
+        "content-length"
+    };
+    req.headers()
+        .get(header)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
 /// Check if the request uses AWS chunked transfer encoding.
@@ -433,6 +479,7 @@ async fn build_object_body(
     encryption: &Option<EncryptionMeta>,
     req_headers: &hyper::header::HeaderMap,
     resource: &str,
+    range: Option<(u64, u64)>,
 ) -> Result<(BoxBody, Option<EncryptionMeta>), Response<BoxBody>> {
     match encryption {
         None => {
@@ -446,7 +493,20 @@ async fn build_object_body(
                     ));
                 }
             };
-            let reader_stream = ReaderStream::new(file);
+            let reader = match range {
+                Some((start, end)) => {
+                    let mut file = file;
+                    if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+                        return Err(error_response(
+                            S3Error::InternalError(e.to_string()),
+                            resource,
+                        ));
+                    }
+                    file.take(end - start + 1)
+                }
+                None => file.take(u64::MAX),
+            };
+            let reader_stream = ReaderStream::new(reader);
             let stream_body = StreamBody::new(reader_stream.map_ok(Frame::data)).boxed();
             Ok((stream_body, None))
         }
@@ -476,7 +536,8 @@ async fn build_object_body(
                         }
                     };
                     let body =
-                        encryption::build_decrypting_body(file, key, nonce, enc.plaintext_size);
+                        decrypting_body(file, key, nonce, enc.plaintext_size, range, resource)
+                            .await?;
                     Ok((body, Some(enc.clone())))
                 }
                 SseAlgorithm::SseC => {
@@ -511,17 +572,139 @@ async fn build_object_body(
                             ));
                         }
                     };
-                    let body = encryption::build_decrypting_body(
-                        file,
-                        cust_key,
-                        nonce,
-                        enc.plaintext_size,
-                    );
+                    let body =
+                        decrypting_body(file, cust_key, nonce, enc.plaintext_size, range, resource)
+                            .await?;
                     Ok((body, Some(enc.clone())))
                 }
             }
         }
     }
+}
+
+/// Decrypting body for the whole object or for an inclusive plaintext range:
+/// seeks to the first encrypted chunk of the range and decrypts only the chunks needed.
+async fn decrypting_body(
+    mut file: tokio::fs::File,
+    key: [u8; 32],
+    nonce: [u8; 12],
+    plaintext_size: u64,
+    range: Option<(u64, u64)>,
+    resource: &str,
+) -> Result<BoxBody, Response<BoxBody>> {
+    let (start, len) = match range {
+        Some((start, end)) => (start, end - start + 1),
+        None => (0, plaintext_size),
+    };
+    let (offset, _) = encryption::ciphertext_chunk_for(start);
+    if offset > 0 {
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+            return Err(error_response(
+                S3Error::InternalError(e.to_string()),
+                resource,
+            ));
+        }
+    }
+    Ok(encryption::build_decrypting_range_body(
+        file,
+        key,
+        nonce,
+        plaintext_size,
+        start,
+        len,
+    ))
+}
+
+/// Parse a `Range` header against an object of `total` bytes.
+/// Supports a single `bytes=a-b`, `bytes=a-` or `bytes=-n` range and returns the
+/// inclusive (start, end). A missing, malformed or multi-range header is ignored
+/// (full object, as S3 does); a well-formed but unsatisfiable range is `InvalidRange`.
+pub(crate) fn parse_range(
+    headers: &hyper::header::HeaderMap,
+    total: u64,
+) -> Result<Option<(u64, u64)>, S3Error> {
+    let Some(value) = headers.get("range").and_then(|v| v.to_str().ok()) else {
+        return Ok(None);
+    };
+    let Some(spec) = value.trim().strip_prefix("bytes=") else {
+        return Ok(None);
+    };
+    if spec.contains(',') {
+        return Ok(None);
+    }
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return Ok(None);
+    };
+    let (first, last) = (first.trim(), last.trim());
+    let parse = |v: &str| v.parse::<u64>().ok();
+    match (first.is_empty(), last.is_empty()) {
+        // bytes=-n: last n bytes
+        (true, false) => {
+            let Some(n) = parse(last) else {
+                return Ok(None);
+            };
+            if n == 0 || total == 0 {
+                return Err(S3Error::InvalidRange);
+            }
+            Ok(Some((total.saturating_sub(n), total - 1)))
+        }
+        // bytes=a-
+        (false, true) => {
+            let Some(start) = parse(first) else {
+                return Ok(None);
+            };
+            if start >= total {
+                return Err(S3Error::InvalidRange);
+            }
+            Ok(Some((start, total - 1)))
+        }
+        // bytes=a-b
+        (false, false) => {
+            let (Some(start), Some(end)) = (parse(first), parse(last)) else {
+                return Ok(None);
+            };
+            if end < start {
+                return Ok(None);
+            }
+            if start >= total {
+                return Err(S3Error::InvalidRange);
+            }
+            Ok(Some((start, end.min(total - 1))))
+        }
+        (true, true) => Ok(None),
+    }
+}
+
+/// 416 InvalidRange response with `Content-Range: bytes */total`.
+fn range_not_satisfiable(total: u64, resource: &str) -> Response<BoxBody> {
+    let mut resp = error_response(S3Error::InvalidRange, resource);
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&format!("bytes */{}", total)) {
+        resp.headers_mut().insert("Content-Range", v);
+    }
+    resp
+}
+
+/// Turn a 200 response builder into a 206 partial response for `range`.
+fn apply_range(
+    builder: hyper::http::response::Builder,
+    range: Option<(u64, u64)>,
+    total: u64,
+) -> hyper::http::response::Builder {
+    let Some((start, end)) = range else {
+        return builder;
+    };
+    let mut builder = builder.status(StatusCode::PARTIAL_CONTENT);
+    if let Some(headers) = builder.headers_mut() {
+        if let Ok(v) = hyper::header::HeaderValue::from_str(&(end - start + 1).to_string()) {
+            headers.insert("Content-Length", v);
+        }
+        if let Ok(v) =
+            hyper::header::HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, total))
+        {
+            headers.insert("Content-Range", v);
+        }
+    }
+    builder
 }
 
 /// GET /{bucket}/{key+} — Download an object (streams file from disk).
@@ -561,6 +744,15 @@ pub async fn get_object(
             Err(e) => return error_response(e, &resource),
         };
 
+        let content_length = ver_meta
+            .encryption
+            .as_ref()
+            .map_or(ver_meta.size, |e| e.plaintext_size);
+        let range = match parse_range(req_headers, content_length) {
+            Ok(r) => r,
+            Err(_) => return range_not_satisfiable(content_length, &resource),
+        };
+
         // Build body (decrypt if encrypted)
         let (stream_body, enc) = match build_object_body(
             &config,
@@ -568,17 +760,13 @@ pub async fn get_object(
             &ver_meta.encryption,
             req_headers,
             &resource,
+            range,
         )
         .await
         {
             Ok(r) => r,
             Err(resp) => return resp,
         };
-
-        let content_length = ver_meta
-            .encryption
-            .as_ref()
-            .map_or(ver_meta.size, |e| e.plaintext_size);
 
         let mut builder = Response::builder()
             .status(StatusCode::OK)
@@ -592,6 +780,7 @@ pub async fn get_object(
             builder = apply_stored_metadata_headers(builder, m);
         }
         builder = apply_sse_headers_to_builder(builder, &enc);
+        builder = apply_range(builder, range, content_length);
         return builder.body(stream_body).unwrap();
     }
 
@@ -613,12 +802,17 @@ pub async fn get_object(
             }
             Ok(Some((vid, false))) => match storage.get_object_meta(bucket, key).await {
                 Ok((meta, file_path)) => {
+                    let range = match parse_range(req_headers, meta.content_length) {
+                        Ok(r) => r,
+                        Err(_) => return range_not_satisfiable(meta.content_length, &resource),
+                    };
                     let (stream_body, enc) = match build_object_body(
                         &config,
                         &file_path,
                         &meta.encryption,
                         req_headers,
                         &resource,
+                        range,
                     )
                     .await
                     {
@@ -630,6 +824,7 @@ pub async fn get_object(
                         object_meta_headers(Response::builder().status(StatusCode::OK), &meta)
                             .header("x-amz-version-id", &vid);
                     let builder = apply_sse_headers_to_builder(builder, &enc);
+                    let builder = apply_range(builder, range, meta.content_length);
                     return builder.body(stream_body).unwrap();
                 }
                 Err(e) => return error_response(e, &resource),
@@ -642,12 +837,17 @@ pub async fn get_object(
     // Normal GET (unversioned)
     match storage.get_object_meta(bucket, key).await {
         Ok((meta, file_path)) => {
+            let range = match parse_range(req_headers, meta.content_length) {
+                Ok(r) => r,
+                Err(_) => return range_not_satisfiable(meta.content_length, &resource),
+            };
             let (stream_body, enc) = match build_object_body(
                 &config,
                 &file_path,
                 &meta.encryption,
                 req_headers,
                 &resource,
+                range,
             )
             .await
             {
@@ -657,6 +857,7 @@ pub async fn get_object(
 
             let builder = object_meta_headers(Response::builder().status(StatusCode::OK), &meta);
             let builder = apply_sse_headers_to_builder(builder, &enc);
+            let builder = apply_range(builder, range, meta.content_length);
             builder.body(stream_body).unwrap()
         }
         Err(e) => error_response(e, &resource),
@@ -804,7 +1005,10 @@ pub async fn delete_object(
         };
 
         // Sync normal path after version removal
-        if let Err(e) = storage.sync_normal_path(bucket, key).await {
+        let synced = storage.sync_normal_path(bucket, key).await;
+        // Version files moved around: let the background recount settle the quota
+        storage.quota.mark_dirty();
+        if let Err(e) = synced {
             return error_response(e, &resource);
         }
 
@@ -824,12 +1028,34 @@ pub async fn delete_object(
         .unwrap_or(VersioningStatus::Unversioned);
 
     match version_id_for_status(&versioning) {
-        Some(vid) => create_delete_marker_and_respond(&storage, bucket, key, &vid, &resource).await,
+        Some(vid) => {
+            let response =
+                create_delete_marker_and_respond(&storage, bucket, key, &vid, &resource).await;
+            storage.quota.mark_dirty();
+            response
+        }
         None => match storage.delete_object(bucket, key).await {
             Ok(()) => empty_response(StatusCode::NO_CONTENT),
             Err(e) => error_response(e, &resource),
         },
     }
+}
+
+/// Parse an `x-amz-copy-source` value: `[/]bucket/key[?versionId=X]`.
+/// Returns (bucket, URL-decoded key, version ID). Used both by the router
+/// (source authorization) and by `copy_object`, so both see the same object.
+pub(crate) fn parse_copy_source(raw: &str) -> Option<(String, String, Option<String>)> {
+    let source = raw.trim_start_matches('/');
+    let (source_path, version_id) = match source.find("?versionId=") {
+        Some(pos) => (&source[..pos], Some(source[pos + 11..].to_string())),
+        None => (source, None),
+    };
+    let (bucket, key) = source_path.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    // URL-decode the source key (AWS CLI may encode it)
+    Some((bucket.to_string(), url_decode(key), version_id))
 }
 
 /// PUT /{bucket}/{key+} with x-amz-copy-source — Copy an object.
@@ -875,27 +1101,17 @@ pub async fn copy_object(
     };
 
     // Parse x-amz-copy-source: /source-bucket/source-key[?versionId=X]
-    let source = copy_source.trim_start_matches('/');
-
-    // Extract versionId from copy source if present
-    let (source_path, source_version_id) = if let Some(pos) = source.find("?versionId=") {
-        (&source[..pos], Some(&source[pos + 11..]))
-    } else {
-        (source, None)
-    };
-
-    let (src_bucket, src_key) = match source_path.find('/') {
-        Some(pos) => (&source_path[..pos], &source_path[pos + 1..]),
+    let (src_bucket, src_key, source_version_id) = match parse_copy_source(copy_source) {
+        Some(parsed) => parsed,
         None => {
             return error_response(
-                S3Error::InternalError("Invalid copy source".to_string()),
+                S3Error::InvalidArgument("Invalid copy source".to_string()),
                 &resource,
             );
         }
     };
-
-    // URL-decode the source key (AWS CLI may encode it)
-    let src_key = url_decode(src_key);
+    let src_bucket = src_bucket.as_str();
+    let source_version_id = source_version_id.as_deref();
 
     // Resolve source data path and encryption metadata
     let (src_data_path, src_enc_meta, src_stored_meta) = if let Some(vid) = source_version_id {
@@ -953,7 +1169,18 @@ pub async fn copy_object(
         }
     }
 
-    let tmp_path = crate::storage::atomic_tmp_path(&dst_path);
+    // Reserve quota for the copy (plaintext size; doubled when the destination keeps versions)
+    let src_size = match src_enc_meta {
+        Some(ref enc) => enc.plaintext_size,
+        None => crate::quota::file_size(&src_data_path).await,
+    };
+    let dst_versioned = is_versioned(storage, bucket).await;
+    let mut reservation = storage.quota.reservation(if dst_versioned { 2 } else { 1 });
+    if let Err(e) = reservation.ensure(src_size) {
+        return error_response(e, &resource);
+    }
+
+    let tmp_path = storage.tmp_file();
 
     // Determine if source needs decryption
     let needs_decrypt = src_enc_meta.is_some();
@@ -997,11 +1224,13 @@ pub async fn copy_object(
         )
         .await
         {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
             return error_response(e, &resource);
         }
     } else {
         // No decryption needed: raw copy
         if let Err(e) = tokio::fs::copy(&src_data_path, &tmp_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
             return error_response(S3Error::InternalError(e.to_string()), &resource);
         }
     }
@@ -1016,8 +1245,17 @@ pub async fn copy_object(
     };
 
     // Atomic rename to destination
-    if let Err(e) = tokio::fs::rename(&tmp_path, &dst_path).await {
-        return error_response(S3Error::InternalError(e.to_string()), &resource);
+    {
+        let _path_guard = storage.quota.lock_path(&dst_path).await;
+        let copied = crate::quota::file_size(&tmp_path).await;
+        let replaced = crate::quota::file_size(&dst_path).await;
+        if let Err(e) = tokio::fs::rename(&tmp_path, &dst_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return error_response(S3Error::InternalError(e.to_string()), &resource);
+        }
+        // With versioning, the factor-2 reservation covers the version copy
+        reservation.commit(copied);
+        storage.quota.release(replaced);
     }
 
     // Encrypt destination if requested
@@ -1025,7 +1263,9 @@ pub async fn copy_object(
         SseRequest::None => None,
         SseRequest::SseS3 => {
             let enc_config = config.encryption.as_ref().unwrap();
-            match encryption::encrypt_sse_s3(&dst_path, &enc_config.master_key).await {
+            match encryption::encrypt_sse_s3(&dst_path, &storage.tmp_file(), &enc_config.master_key)
+                .await
+            {
                 Ok(meta) => Some(meta),
                 Err(e) => return error_response(e, &resource),
             }
@@ -1033,7 +1273,7 @@ pub async fn copy_object(
         SseRequest::SseC {
             ref key,
             ref key_md5,
-        } => match encryption::encrypt_sse_c(&dst_path, key, key_md5).await {
+        } => match encryption::encrypt_sse_c(&dst_path, &storage.tmp_file(), key, key_md5).await {
             Ok(meta) => Some(meta),
             Err(e) => return error_response(e, &resource),
         },

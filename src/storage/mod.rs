@@ -8,8 +8,10 @@ pub mod policy;
 pub mod versioning;
 
 use std::path::{Component, PathBuf};
+use std::sync::Arc;
 
 use crate::error::S3Error;
+use crate::quota::Quota;
 
 /// Sentinel file for directory marker objects (keys ending with `/`).
 /// On S3, `prefix/` is a valid object key, but on the filesystem a trailing
@@ -17,14 +19,39 @@ use crate::error::S3Error;
 /// directory so that both the "directory object" and nested objects can coexist.
 pub(crate) const DIR_MARKER: &str = ".dir_marker";
 
+/// Directory (directly under the data directory) holding in-flight temporary files.
+pub const TMP_DIR: &str = ".loch-tmp";
+
 /// Shared storage backend backed by the local filesystem.
 pub struct Storage {
     pub data_dir: PathBuf,
+    /// Storage quota for the whole data directory (unlimited by default).
+    pub quota: Arc<Quota>,
 }
 
 impl Storage {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+        Self::with_quota(data_dir, None)
+    }
+
+    /// Create a storage backend with an optional quota (in bytes) on the whole data directory.
+    pub fn with_quota(data_dir: PathBuf, max_bytes: Option<u64>) -> Self {
+        Self {
+            data_dir,
+            quota: Arc::new(Quota::new(max_bytes)),
+        }
+    }
+
+    /// New temporary file path for an atomic write (write to tmp, then rename).
+    /// Temporary files live in `{data_dir}/.loch-tmp/`, never next to objects: a
+    /// bucket name cannot start with '.', so no bucket or object key can collide
+    /// with them, and leftovers can be removed safely at startup. The data
+    /// directory must be a single filesystem (rename across it must be atomic).
+    pub(crate) fn tmp_file(&self) -> PathBuf {
+        let dir = self.data_dir.join(TMP_DIR);
+        // Cheap when it already exists; recreated if removed while running
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{}.tmp", uuid::Uuid::new_v4()))
     }
 
     /// Resolve a safe bucket path. Validates the bucket name and ensures
@@ -60,7 +87,7 @@ impl Storage {
 /// Assert that a path stays within the base directory.
 /// Rejects any Component::ParentDir ("..") and verifies the normalized path
 /// starts with the base directory.
-fn assert_path_within(path: &PathBuf, base: &PathBuf) -> Result<(), S3Error> {
+pub(crate) fn assert_path_within(path: &PathBuf, base: &PathBuf) -> Result<(), S3Error> {
     for component in path.components() {
         if matches!(component, Component::ParentDir) {
             return Err(S3Error::AccessDenied);
@@ -161,17 +188,6 @@ pub fn validate_object_key(key: &str) -> Result<(), S3Error> {
 
 pub use bucket::BucketInfo;
 pub use object::{ListObjectsResult, ObjectMetadata};
-
-/// Generate a UUID-based temporary file path next to the given path.
-/// Used for atomic writes (write to tmp, then rename).
-pub(crate) fn atomic_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
-    let tmp_name = format!(
-        "{}.{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        uuid::Uuid::new_v4()
-    );
-    path.with_file_name(&tmp_name)
-}
 
 /// Guess MIME content type from file extension.
 pub fn guess_content_type(key: &str) -> String {

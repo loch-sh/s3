@@ -82,7 +82,7 @@ pub fn parse_cors_xml(xml_bytes: &[u8]) -> Result<CorsConfiguration, S3Error> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_string();
                 if name == "CORSRule" {
                     in_rule = true;
                     allowed_origins.clear();
@@ -96,7 +96,7 @@ pub fn parse_cors_xml(xml_bytes: &[u8]) -> Result<CorsConfiguration, S3Error> {
             }
             Ok(Event::Text(ref e)) => {
                 if in_rule && !current_element.is_empty() {
-                    let text = e.decode().map_err(|_| S3Error::MalformedXML)?.to_string();
+                    let text = AsRef::<str>::as_ref(e).to_string();
                     match current_element.as_str() {
                         "AllowedOrigin" => allowed_origins.push(text),
                         "AllowedMethod" => allowed_methods.push(text),
@@ -111,7 +111,7 @@ pub fn parse_cors_xml(xml_bytes: &[u8]) -> Result<CorsConfiguration, S3Error> {
                 }
             }
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_string();
                 if name == "CORSRule" && in_rule {
                     if allowed_origins.is_empty() || allowed_methods.is_empty() {
                         return Err(S3Error::MalformedXML);

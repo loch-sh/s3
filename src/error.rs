@@ -19,6 +19,9 @@ pub enum S3Error {
     InvalidPartOrder,
     InvalidObjectKey,
     EntityTooLarge,
+    QuotaExceeded,
+    InvalidRange,
+    RequestTimeout,
     RequestTimeTooSkewed,
     ExpiredToken,
     NoSuchVersion,
@@ -110,6 +113,21 @@ impl S3Error {
                 "EntityTooLarge",
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Your proposed upload exceeds the maximum allowed size.",
+            ),
+            S3Error::QuotaExceeded => (
+                "QuotaExceeded",
+                StatusCode::FORBIDDEN,
+                "The storage quota of this server has been exceeded.",
+            ),
+            S3Error::InvalidRange => (
+                "InvalidRange",
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "The requested range is not satisfiable",
+            ),
+            S3Error::RequestTimeout => (
+                "RequestTimeout",
+                StatusCode::BAD_REQUEST,
+                "Your socket connection to the server was not read from or written to within the timeout period.",
             ),
             S3Error::RequestTimeTooSkewed => (
                 "RequestTimeTooSkewed",

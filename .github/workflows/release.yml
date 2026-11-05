@@ -21,12 +21,6 @@ jobs:
           - target: x86_64-pc-windows-gnu
             runner: ubuntu-latest
             archive: s3-windows-amd64.zip
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            archive: s3-macos-amd64.tar.gz
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            archive: s3-macos-arm64.tar.gz
 
     steps:
       - uses: actions/checkout@v7
@@ -54,11 +48,7 @@ jobs:
         if: contains(matrix.target, 'windows')
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Build (cargo)
-        if: matrix.runner == 'macos-latest'
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Archive (Linux / macOS)
+      - name: Archive (Linux)
         if: "!contains(matrix.target, 'windows')"
         run: tar czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release s3 loch-s3
 
@@ -71,9 +61,40 @@ jobs:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
 
+  # Both macOS targets in a single job: macOS runners are scarce, and the
+  # Apple Silicon runner builds x86_64 with the same SDK.
+  build-macos:
+    name: Build macOS (arm64 + amd64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Archive
+        run: |
+          tar czf s3-macos-arm64.tar.gz -C target/aarch64-apple-darwin/release s3 loch-s3
+          tar czf s3-macos-amd64.tar.gz -C target/x86_64-apple-darwin/release s3 loch-s3
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: s3-macos
+          path: s3-macos-*.tar.gz
+
+  # Published as soon as the Linux and Windows binaries are ready, even when
+  # the macOS job failed (usually no runner assigned). "Re-run failed jobs"
+  # then re-runs build-macos and this job, which adds the macOS archives to
+  # the existing release.
   release:
     name: Create Release
-    needs: build
+    needs: [build, build-macos]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -97,6 +118,14 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           body: ${{ steps.cliff.outputs.content }}
+          overwrite_files: true
           files: |
             *.tar.gz
             *.zip
+
+      - name: Report missing macOS binaries
+        if: needs.build-macos.result != 'success'
+        run: |
+          echo "::warning::macOS binaries are missing (build-macos: ${{ needs.build-macos.result }}). Re-run the failed jobs of this run to add them to the release."
+          echo "### macOS binaries missing" >> "$GITHUB_STEP_SUMMARY"
+          echo "build-macos ended with \`${{ needs.build-macos.result }}\`. Use **Re-run failed jobs** to add them to the release." >> "$GITHUB_STEP_SUMMARY"

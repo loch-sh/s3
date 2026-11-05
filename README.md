@@ -40,7 +40,7 @@ aws --endpoint-url http://localhost:8080 s3 cp file.txt s3://my-bucket/file.txt
 - Storage quota (`S3_MAX_STORAGE_BYTES`) and health endpoint (`/_loch/health`)
 - Multi-user with bucket ownership and ARN-based bucket policies
 - User management REST API (`/_loch/users`)
-- SSE-S3 and SSE-C encryption (AES-256-GCM)
+- SSE-S3 and SSE-C encryption (AES-256-GCM), optional encryption of every write by default, master key from a file
 - CORS, ACLs, bucket default encryption
 - AWS Signature V4, HTTP/2
 - Docker multi-arch image (~15 MB), fixed uid `100` (same as previous releases), runs with a read-only root filesystem

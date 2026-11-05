@@ -7,6 +7,7 @@ This page describes how to run Loch S3 as a managed service (one container per t
 - [Container Image](#container-image)
 - [Read-Only Root Filesystem and Mounts](#read-only-root-filesystem-and-mounts)
 - [Read-Only Users File](#read-only-users-file)
+- [Encryption at Rest](#encryption-at-rest)
 - [Initial Buckets](#initial-buckets)
 - [Storage Quota](#storage-quota)
 - [Health and Usage Endpoints](#health-and-usage-endpoints)
@@ -117,6 +118,33 @@ Example with a root account and a read-only user:
   }]
 }
 ```
+
+---
+
+## Encryption at Rest
+
+To encrypt every tenant's data with SSE-S3 without putting the key in the environment (visible in `docker inspect` and in the compose file):
+
+```bash
+openssl rand -base64 32 > /srv/tenant-a/secrets/master.key
+chown 100:101 /srv/tenant-a/secrets/master.key   # the container uid
+chmod 0400 /srv/tenant-a/secrets/master.key
+```
+
+```yaml
+    environment:
+      S3_ENCRYPTION_KEY_FILE: /run/secrets/master.key
+      S3_ENCRYPT_BY_DEFAULT: "true"
+    volumes:
+      - /srv/tenant-a/secrets:/run/secrets:ro
+```
+
+- `S3_ENCRYPTION_KEY_FILE` holds the base64 key, with or without a trailing newline. Startup fails (exit 1) if the file is missing, unreadable or invalid, or if `S3_ENCRYPTION_KEY` is also set. The key is never logged.
+- `S3_ENCRYPT_BY_DEFAULT=true` encrypts every write that carries no SSE header: `PutObject`, `CopyObject`, `CompleteMultipartUpload`, and the copies stored as versions. Responses carry `x-amz-server-side-encryption: AES256`. SSE-C headers sent by the client still take precedence. Without a key, startup fails (exit 1).
+- Objects written before the flag was turned on stay in plaintext and remain readable; they are encrypted when rewritten (for example by copying an object onto itself).
+- Encryption happens once the payload is on disk: a `PutObject` body is written, then encrypted in place, and multipart parts stay in plaintext in `.uploads/` until `CompleteMultipartUpload`. A crash in between can leave plaintext behind. The guarantee is "encrypted at rest once the write has completed", not "never written in plaintext".
+- Losing the key makes every SSE-S3 object unreadable: back it up separately from the data.
+- With an empty named volume, Docker copies the image's `/data` (owned by `100:101`) on first mount. When forcing another uid with `--user`, either use a bind mount or `volume-nocopy`, or chown after the first mount.
 
 ---
 

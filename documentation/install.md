@@ -144,6 +144,8 @@ All configuration is done via environment variables. No configuration file is re
 | `S3_ADMIN_API_KEY` | _(none)_ | Bearer token for the `/_loch/users` administration API |
 | `S3_UPLOAD_TTL` | `86400` | Multipart upload expiry in seconds (default: 24 hours) |
 | `S3_ENCRYPTION_KEY` | _(none)_ | Base64-encoded SSE-S3 master key (exactly 32 bytes) |
+| `S3_ENCRYPTION_KEY_FILE` | _(none)_ | Path to a file holding the base64 master key (trailing newline allowed). Mutually exclusive with `S3_ENCRYPTION_KEY`; keeps the key out of the environment |
+| `S3_ENCRYPT_BY_DEFAULT` | `false` | `true`: every write without SSE headers is encrypted with SSE-S3 (PutObject, CopyObject, multipart, versions). Requires a master key |
 | `S3_MAX_STORAGE_BYTES` | _(unlimited)_ | Storage quota in bytes for the whole data directory (objects, versions, pending multipart parts). Refusals: `403 QuotaExceeded` |
 | `S3_INIT_BUCKETS` | _(none)_ | Comma-separated buckets created at startup if missing, owned by the root user. Invalid name: startup fails |
 | `S3_SHUTDOWN_GRACE` | `8` | Seconds granted to in-flight requests after `SIGTERM`/`SIGINT` |
@@ -152,7 +154,7 @@ All configuration is done via environment variables. No configuration file is re
 **Notes:**
 
 - `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` must be set together or not at all.
-- `S3_ENCRYPTION_KEY` must be exactly 32 bytes (256 bits) encoded in base64. Generate with `openssl rand -base64 32`.
+- `S3_ENCRYPTION_KEY` (or the content of `S3_ENCRYPTION_KEY_FILE`) must be exactly 32 bytes (256 bits) encoded in base64. Generate with `openssl rand -base64 32`. Setting both, an empty value, or an unreadable or invalid file makes the server exit with status 1, as does `S3_ENCRYPT_BY_DEFAULT=true` without a key. The key never appears in the logs.
 - `S3_ADMIN_API_KEY` only has effect in multi-user mode (`S3_USERS_FILE`). In single-user mode (environment variables), the admin API is disabled even if the key is set. Without it, the users file is never written and can be mounted read-only.
 - Invalid values (non-numeric quota, invalid bucket name in `S3_INIT_BUCKETS`, unreadable users file) make the server exit with status 1.
 

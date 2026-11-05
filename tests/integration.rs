@@ -61,7 +61,15 @@ async fn start_server_full(
 /// Start a test server with SSE-S3 encryption enabled.
 async fn start_server_with_encryption() -> (String, std::path::PathBuf, [u8; 32]) {
     let master_key = [0x42u8; 32]; // deterministic test key
-    let (url, tmp) = start_server_full(None, None, Some(EncryptionConfig { master_key })).await;
+    let (url, tmp) = start_server_full(
+        None,
+        None,
+        Some(EncryptionConfig {
+            master_key,
+            encrypt_by_default: false,
+        }),
+    )
+    .await;
     (url, tmp, master_key)
 }
 
@@ -6818,6 +6826,9 @@ fn run_server_briefly_once(envs: &[(&str, String)]) -> (Option<std::process::Exi
         .env_remove("S3_ACCESS_KEY_ID")
         .env_remove("S3_SECRET_ACCESS_KEY")
         .env_remove("S3_INIT_BUCKETS")
+        .env_remove("S3_ENCRYPTION_KEY")
+        .env_remove("S3_ENCRYPTION_KEY_FILE")
+        .env_remove("S3_ENCRYPT_BY_DEFAULT")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
     for (k, v) in envs {
@@ -7611,4 +7622,479 @@ async fn test_quota_exceeded_refuses_empty_writes() {
         .unwrap();
     assert_eq!(r.status(), 200);
     cleanup(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Server-side encryption by default (S3_ENCRYPT_BY_DEFAULT) and key file
+// ---------------------------------------------------------------------------
+
+/// Start an in-process server on an existing data directory.
+async fn start_server_in_dir(
+    dir: &std::path::Path,
+    encryption: Option<EncryptionConfig>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = Arc::new(ServerConfig {
+        storage: Arc::new(Storage::new(dir.to_path_buf())),
+        user_store: None,
+        admin_api_key: None,
+        upload_ttl_secs: 86400,
+        encryption,
+    });
+    tokio::spawn(async move {
+        s3::serve(listener, config).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    format!("http://127.0.0.1:{}", port)
+}
+
+fn by_default_config() -> Option<EncryptionConfig> {
+    Some(EncryptionConfig {
+        master_key: [0x24u8; 32],
+        encrypt_by_default: true,
+    })
+}
+
+/// A recognizable payload spanning several 1 MiB encryption chunks.
+fn marked_payload(len: usize) -> Vec<u8> {
+    b"LOCH-PLAINTEXT-MARKER-"
+        .iter()
+        .cycle()
+        .take(len)
+        .copied()
+        .collect()
+}
+
+fn contains_marker(data: &[u8]) -> bool {
+    data.windows(22).any(|w| w == b"LOCH-PLAINTEXT-MARKER-")
+}
+
+fn sse_header(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("x-amz-server-side-encryption")
+        .map(|v| v.to_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn test_encrypt_by_default_put_get_range() {
+    let tmp = std::env::temp_dir().join(format!("s3-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let base = start_server_in_dir(&tmp, by_default_config()).await;
+    let client = reqwest::Client::new();
+    client.put(format!("{base}/sse-def")).send().await.unwrap();
+
+    let payload = marked_payload(2 * 1024 * 1024 + 4321);
+    let resp = client
+        .put(format!("{base}/sse-def/obj.bin"))
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp).as_deref(), Some("AES256"));
+
+    // Stored encrypted: no plaintext on disk, and larger (GCM tags)
+    let on_disk = std::fs::read(tmp.join("sse-def/obj.bin")).unwrap();
+    assert!(!contains_marker(&on_disk), "object stored in plaintext");
+    assert!(on_disk.len() > payload.len());
+
+    let resp = client
+        .get(format!("{base}/sse-def/obj.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp).as_deref(), Some("AES256"));
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), &payload[..]);
+
+    let resp = client
+        .head(format!("{base}/sse-def/obj.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_header(&resp).as_deref(), Some("AES256"));
+
+    // Range across the first 1 MiB chunk boundary
+    let (start, end) = (1024 * 1024 - 10, 1024 * 1024 + 99);
+    let resp = client
+        .get(format!("{base}/sse-def/obj.bin"))
+        .header("Range", format!("bytes={start}-{end}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        format!("bytes {start}-{end}/{}", payload.len())
+    );
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), &payload[start..=end]);
+
+    // Suffix range (last bytes)
+    let resp = client
+        .get(format!("{base}/sse-def/obj.bin"))
+        .header("Range", "bytes=-100")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        resp.bytes().await.unwrap().as_ref(),
+        &payload[payload.len() - 100..]
+    );
+
+    cleanup(&tmp);
+}
+
+#[tokio::test]
+async fn test_encrypt_by_default_sse_c_takes_precedence() {
+    let tmp = std::env::temp_dir().join(format!("s3-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let base = start_server_in_dir(&tmp, by_default_config()).await;
+    let client = reqwest::Client::new();
+    let (_, key_b64, key_md5) = generate_customer_key();
+    client
+        .put(format!("{base}/sse-def-c"))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .put(format!("{base}/sse-def-c/f.txt"))
+        .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+        .header("x-amz-server-side-encryption-customer-key", &key_b64)
+        .header("x-amz-server-side-encryption-customer-key-md5", &key_md5)
+        .body(marked_payload(1000))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp), None);
+
+    // SSE-C object: unreadable without the customer key, readable with it
+    let resp = client
+        .get(format!("{base}/sse-def-c/f.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = client
+        .get(format!("{base}/sse-def-c/f.txt"))
+        .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+        .header("x-amz-server-side-encryption-customer-key", &key_b64)
+        .header("x-amz-server-side-encryption-customer-key-md5", &key_md5)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.bytes().await.unwrap().as_ref(),
+        &marked_payload(1000)[..]
+    );
+
+    cleanup(&tmp);
+}
+
+#[tokio::test]
+async fn test_encrypt_by_default_multipart() {
+    let tmp = std::env::temp_dir().join(format!("s3-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let base = start_server_in_dir(&tmp, by_default_config()).await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base}/sse-def-mp"))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/sse-def-mp/big.bin?uploads"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp).as_deref(), Some("AES256"));
+    let upload_id = extract_xml_value(&resp.text().await.unwrap(), "UploadId");
+
+    let payload = marked_payload(3 * 1024 * 1024 + 17);
+    let (p1, p2) = payload.split_at(1536 * 1024);
+    let mut etags = Vec::new();
+    for (n, part) in [(1, p1), (2, p2)] {
+        let resp = client
+            .put(format!(
+                "{base}/sse-def-mp/big.bin?partNumber={n}&uploadId={upload_id}"
+            ))
+            .body(part.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        etags.push(
+            resp.headers()
+                .get("etag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let complete = format!(
+        "<CompleteMultipartUpload>\
+           <Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+           <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part>\
+         </CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let resp = client
+        .post(format!("{base}/sse-def-mp/big.bin?uploadId={upload_id}"))
+        .body(complete)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp).as_deref(), Some("AES256"));
+
+    let on_disk = std::fs::read(tmp.join("sse-def-mp/big.bin")).unwrap();
+    assert!(
+        !contains_marker(&on_disk),
+        "multipart object stored in plaintext"
+    );
+
+    let resp = client
+        .get(format!("{base}/sse-def-mp/big.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp).as_deref(), Some("AES256"));
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), &payload[..]);
+
+    let resp = client
+        .get(format!("{base}/sse-def-mp/big.bin"))
+        .header("Range", "bytes=1572860-1572870")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        resp.bytes().await.unwrap().as_ref(),
+        &payload[1572860..=1572870]
+    );
+
+    cleanup(&tmp);
+}
+
+#[tokio::test]
+async fn test_encrypt_by_default_keeps_old_objects_and_encrypts_copies_and_versions() {
+    let tmp = std::env::temp_dir().join(format!("s3-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let client = reqwest::Client::new();
+
+    // Written before encryption by default is turned on
+    let before = start_server_in_dir(&tmp, None).await;
+    client
+        .put(format!("{before}/sse-def-old"))
+        .send()
+        .await
+        .unwrap();
+    let old = marked_payload(5000);
+    let resp = client
+        .put(format!("{before}/sse-def-old/old.txt"))
+        .body(old.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let base = start_server_in_dir(&tmp, by_default_config()).await;
+
+    // Old object: still plaintext on disk, readable, no SSE header
+    let resp = client
+        .get(format!("{base}/sse-def-old/old.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp), None);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), &old[..]);
+
+    // CopyObject without SSE header: the copy is encrypted
+    let resp = client
+        .put(format!("{base}/sse-def-old/copy.txt"))
+        .header("x-amz-copy-source", "/sse-def-old/old.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp).as_deref(), Some("AES256"));
+    let on_disk = std::fs::read(tmp.join("sse-def-old/copy.txt")).unwrap();
+    assert!(!contains_marker(&on_disk), "copy stored in plaintext");
+    let resp = client
+        .get(format!("{base}/sse-def-old/copy.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), &old[..]);
+
+    // Versioned bucket: the stored version is encrypted too
+    let resp = client
+        .put(format!("{base}/sse-def-old?versioning"))
+        .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .put(format!("{base}/sse-def-old/v.txt"))
+        .body(marked_payload(3000))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(sse_header(&resp).as_deref(), Some("AES256"));
+    let vid = resp
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let version_data =
+        std::fs::read(tmp.join(format!("sse-def-old/.versions/v.txt/{vid}.data"))).unwrap();
+    assert!(
+        !contains_marker(&version_data),
+        "version stored in plaintext"
+    );
+    let resp = client
+        .get(format!("{base}/sse-def-old/v.txt?versionId={vid}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.bytes().await.unwrap().as_ref(),
+        &marked_payload(3000)[..]
+    );
+
+    cleanup(&tmp);
+}
+
+/// Run the binary with an encryption setup; returns (exit status if it
+/// exited, stderr). `data` must be a scratch directory.
+fn run_with_encryption_env(
+    data: &std::path::Path,
+    envs: &[(&str, String)],
+) -> (Option<std::process::ExitStatus>, String) {
+    let mut all = vec![("S3_DATA_DIR", data.to_string_lossy().to_string())];
+    all.extend(envs.iter().cloned());
+    run_server_briefly(&all)
+}
+
+#[test]
+fn test_encryption_key_file_loading_and_refusals() {
+    let tmp = std::env::temp_dir().join(format!("s3-test-{}", uuid::Uuid::new_v4()));
+    let data = tmp.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let key_b64 = BASE64.encode([0x5Au8; 32]);
+    let file = |name: &str, content: &str| {
+        let p = tmp.join(name);
+        std::fs::write(&p, content).unwrap();
+        p.to_string_lossy().to_string()
+    };
+
+    // Valid file, with and without a trailing newline: the server starts,
+    // and the key never shows up in the logs.
+    for (name, content) in [
+        ("nl.key", format!("{key_b64}\n")),
+        ("crlf.key", format!("{key_b64}\r\n")),
+        ("raw.key", key_b64.clone()),
+    ] {
+        let path = file(name, &content);
+        let (exited, stderr) = run_with_encryption_env(
+            &data,
+            &[
+                ("S3_ENCRYPTION_KEY_FILE", path),
+                ("S3_ENCRYPT_BY_DEFAULT", "true".into()),
+            ],
+        );
+        assert!(exited.is_none(), "{name}: server should start: {stderr}");
+        assert!(stderr.contains("applied by default"), "{stderr}");
+        assert!(!stderr.contains(&key_b64), "key leaked in logs");
+    }
+
+    let refused = |envs: &[(&str, String)], expected: &str| {
+        let (exited, stderr) = run_with_encryption_env(&data, envs);
+        let status = exited.unwrap_or_else(|| panic!("server should refuse to start: {envs:?}"));
+        assert_eq!(status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains(expected),
+            "expected '{expected}' in: {stderr}"
+        );
+        assert!(!stderr.contains(&key_b64), "key leaked in logs");
+    };
+
+    // Missing file
+    let missing = tmp.join("missing.key").to_string_lossy().to_string();
+    refused(&[("S3_ENCRYPTION_KEY_FILE", missing)], "cannot read");
+    // Invalid content: not base64, wrong length, key wrapped in extra text
+    refused(
+        &[("S3_ENCRYPTION_KEY_FILE", file("bad.key", "not base64 !!\n"))],
+        "valid base64",
+    );
+    refused(
+        &[(
+            "S3_ENCRYPTION_KEY_FILE",
+            file("short.key", &BASE64.encode([1u8; 16])),
+        )],
+        "exactly 32 bytes",
+    );
+    refused(
+        &[("S3_ENCRYPTION_KEY_FILE", file("empty.key", ""))],
+        "exactly 32 bytes",
+    );
+    // Both sources at once
+    refused(
+        &[
+            ("S3_ENCRYPTION_KEY", key_b64.clone()),
+            ("S3_ENCRYPTION_KEY_FILE", file("both.key", &key_b64)),
+        ],
+        "mutually exclusive",
+    );
+    // Encryption by default without any key
+    refused(
+        &[("S3_ENCRYPT_BY_DEFAULT", "true".into())],
+        "requires a master key",
+    );
+    // Invalid boolean
+    refused(
+        &[
+            ("S3_ENCRYPTION_KEY_FILE", file("bool.key", &key_b64)),
+            ("S3_ENCRYPT_BY_DEFAULT", "sometimes".into()),
+        ],
+        "must be true or false",
+    );
+    // Empty variables do not silently disable encryption
+    refused(
+        &[("S3_ENCRYPTION_KEY_FILE", String::new())],
+        "set but empty",
+    );
+    refused(&[("S3_ENCRYPTION_KEY", String::new())], "set but empty");
+
+    // Unreadable file (skipped when running as root, which reads anything)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = file("locked.key", &key_b64);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_err() {
+            refused(&[("S3_ENCRYPTION_KEY_FILE", path.clone())], "cannot read");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    cleanup(&tmp);
 }

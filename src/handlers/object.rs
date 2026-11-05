@@ -131,8 +131,11 @@ pub(crate) async fn apply_bucket_default_encryption(
     if !matches!(sse_request, SseRequest::None) {
         return sse_request;
     }
-    if config.encryption.is_none() {
+    let Some(enc_config) = config.encryption.as_ref() else {
         return SseRequest::None;
+    };
+    if enc_config.encrypt_by_default {
+        return SseRequest::SseS3;
     }
     if let Ok(data) = storage.get_bucket_encryption(bucket).await {
         if let Ok(enc) =
@@ -184,6 +187,7 @@ async fn store_version_and_respond(
         .content_type
         .clone()
         .unwrap_or_else(|| guess_content_type(key));
+    let encryption = stored.encryption.clone();
 
     let meta = VersionMeta::from_stored(
         etag.to_string(),
@@ -204,10 +208,11 @@ async fn store_version_and_respond(
         return error_response(e, resource);
     }
 
-    Response::builder()
+    let builder = Response::builder()
         .status(StatusCode::OK)
         .header("ETag", etag)
-        .header("x-amz-version-id", vid)
+        .header("x-amz-version-id", vid);
+    apply_sse_headers_to_builder(builder, &encryption)
         .body(full_body(bytes::Bytes::new()))
         .unwrap()
 }
@@ -1093,6 +1098,9 @@ pub async fn copy_object(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // Same rule as PutObject: server or bucket default encryption applies
+    // when the request carries no SSE header
+    let dst_sse = apply_bucket_default_encryption(dst_sse, storage, &config, bucket).await;
 
     // Parse SSE-C copy source headers (for decrypting SSE-C source)
     let src_sse_c = match encryption::parse_sse_c_copy_source_headers(req.headers()) {

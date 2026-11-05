@@ -44,6 +44,7 @@ pub async fn create_multipart_upload(
         SseRequest::SseS3 => (Some("AES256".to_string()), None),
         SseRequest::SseC { key_md5, .. } => (Some("SSE-C".to_string()), Some(key_md5)),
     };
+    let sse_s3 = sse_algorithm.as_deref() == Some("AES256");
 
     match storage
         .create_multipart_upload(bucket, key, sse_algorithm, sse_customer_key_md5)
@@ -56,7 +57,7 @@ pub async fn create_multipart_upload(
                 key: key.to_string(),
                 upload_id,
             };
-            xml_response(StatusCode::OK, xml::to_xml(&result))
+            with_sse_s3_header(xml_response(StatusCode::OK, xml::to_xml(&result)), sse_s3)
         }
         Err(e) => error_response(e, &resource),
     }
@@ -296,7 +297,8 @@ pub async fn complete_multipart_upload(
                 key: completed_key,
                 etag,
             };
-            xml_response(StatusCode::OK, xml::to_xml(&result))
+            let sse_s3 = upload_meta.sse_algorithm.as_deref() == Some("AES256");
+            with_sse_s3_header(xml_response(StatusCode::OK, xml::to_xml(&result)), sse_s3)
         }
         Err(e) => error_response(e, &resource),
     }
@@ -373,4 +375,16 @@ pub async fn list_multipart_uploads(storage: Arc<Storage>, bucket: &str) -> Resp
         }
         Err(e) => error_response(e, &format!("/{}", bucket)),
     }
+}
+
+/// Add `x-amz-server-side-encryption: AES256` to a multipart response when
+/// the upload is encrypted with SSE-S3, as S3 does.
+fn with_sse_s3_header(mut resp: Response<BoxBody>, sse_s3: bool) -> Response<BoxBody> {
+    if sse_s3 {
+        resp.headers_mut().insert(
+            "x-amz-server-side-encryption",
+            hyper::header::HeaderValue::from_static("AES256"),
+        );
+    }
+    resp
 }

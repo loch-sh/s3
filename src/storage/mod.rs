@@ -27,6 +27,48 @@ pub struct Storage {
     pub data_dir: PathBuf,
     /// Storage quota for the whole data directory (unlimited by default).
     pub quota: Arc<Quota>,
+    /// Multipart uploads being completed (one completion at a time each).
+    completing: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// A temporary file path under `TMP_DIR`, removed when dropped. Writes that
+/// are cancelled mid-way (client disconnect drops the handler future) or fail
+/// therefore never leave temporary files behind. Once the file has been
+/// renamed into place, the removal is a harmless no-op.
+pub(crate) struct TmpPath(PathBuf);
+
+impl std::ops::Deref for TmpPath {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TmpPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TmpPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Exclusive right to complete one multipart upload, released on drop
+/// (including when the request is cancelled).
+pub(crate) struct CompletionGuard<'a> {
+    storage: &'a Storage,
+    upload_id: String,
+}
+
+impl Drop for CompletionGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.storage.completing.lock() {
+            set.remove(&self.upload_id);
+        }
+    }
 }
 
 impl Storage {
@@ -39,7 +81,17 @@ impl Storage {
         Self {
             data_dir,
             quota: Arc::new(Quota::new(max_bytes)),
+            completing: Default::default(),
         }
+    }
+
+    /// Claim the completion of `upload_id`; `None` if already in progress.
+    pub(crate) fn begin_completion(&self, upload_id: &str) -> Option<CompletionGuard<'_>> {
+        let mut set = self.completing.lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(upload_id.to_string()).then(|| CompletionGuard {
+            storage: self,
+            upload_id: upload_id.to_string(),
+        })
     }
 
     /// New temporary file path for an atomic write (write to tmp, then rename).
@@ -47,11 +99,11 @@ impl Storage {
     /// bucket name cannot start with '.', so no bucket or object key can collide
     /// with them, and leftovers can be removed safely at startup. The data
     /// directory must be a single filesystem (rename across it must be atomic).
-    pub(crate) fn tmp_file(&self) -> PathBuf {
+    pub(crate) fn tmp_file(&self) -> TmpPath {
         let dir = self.data_dir.join(TMP_DIR);
         // Cheap when it already exists; recreated if removed while running
         let _ = std::fs::create_dir_all(&dir);
-        dir.join(format!("{}.tmp", uuid::Uuid::new_v4()))
+        TmpPath(dir.join(format!("{}.tmp", uuid::Uuid::new_v4())))
     }
 
     /// Resolve a safe bucket path. Validates the bucket name and ensures
@@ -154,7 +206,9 @@ pub fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
 /// Validate an object key.
 /// - 1 to 1024 bytes
 /// - No null bytes
-/// - No ".." path component (prevents path traversal)
+/// - No "..", "." or empty path component (prevents path traversal and
+///   aliasing: one key maps to exactly one path); a single trailing '/'
+///   (directory marker) is allowed
 /// - No component matching DIR_MARKER (prevents sentinel collision)
 /// - First component must not match any INTERNAL_NAMES (prevents bucket state overwrites)
 pub fn validate_object_key(key: &str) -> Result<(), S3Error> {
@@ -166,19 +220,41 @@ pub fn validate_object_key(key: &str) -> Result<(), S3Error> {
         return Err(S3Error::InvalidObjectKey);
     }
 
+    // A key ending with '/' is a directory marker: its last component is empty.
+    let body = key.strip_suffix('/').unwrap_or(key);
+    // Each component is a directory on disk: bound the nesting so a single
+    // request cannot create hundreds of directories.
+    if body.split('/').count() > MAX_KEY_DEPTH {
+        return Err(S3Error::InvalidObjectKey);
+    }
     let mut first = true;
-    for component in key.split('/') {
-        // Reject ".." to prevent path traversal
-        if component == ".." {
+    for component in body.split('/') {
+        // Reject "..", "." and empty components: the filesystem resolves
+        // "a/./b", "a//b", "./x" and "/x" to another key (possibly an
+        // internal file such as "./.policy.json"), while authorization
+        // would see the literal key. One key = one path.
+        if component.is_empty() || component == "." || component == ".." {
             return Err(S3Error::InvalidObjectKey);
         }
-        // Reject DIR_MARKER to prevent collision with directory marker sentinels
-        if component == DIR_MARKER {
+        // Reject DIR_MARKER to prevent collision with directory marker sentinels.
+        // Names are compared case-insensitively: on a case-insensitive
+        // filesystem (macOS, Windows) ".METADATA" is the same file as ".metadata".
+        if component.eq_ignore_ascii_case(DIR_MARKER) {
             return Err(S3Error::InvalidObjectKey);
         }
         // Reject internal names as the first component to prevent bucket state overwrites
-        if first && INTERNAL_NAMES.contains(&component) {
+        if first
+            && INTERNAL_NAMES
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(component))
+        {
             return Err(S3Error::AccessDenied);
+        }
+        // Windows: '\' is a path separator, ':' selects an NTFS stream and a
+        // trailing '.' or ' ' is stripped, so such names alias other files
+        #[cfg(windows)]
+        if component.contains(['\\', ':']) || component.ends_with(['.', ' ']) {
+            return Err(S3Error::InvalidObjectKey);
         }
         first = false;
     }
@@ -246,6 +322,38 @@ pub fn guess_content_type(key: &str) -> String {
 
 /// Internal file and directory names that should be excluded from object listings
 /// and "bucket empty" checks (metadata, policies, CORS, uploads, versions, ACLs).
+/// True when `dir` is on a case-insensitive filesystem: a probe file created
+/// under `TMP_DIR` is visible under its upper-case name.
+pub fn is_case_insensitive(dir: &std::path::Path) -> bool {
+    let tmp = dir.join(TMP_DIR);
+    let _ = std::fs::create_dir_all(&tmp);
+    let name = format!("case-probe-{}", uuid::Uuid::new_v4().simple());
+    let lower = tmp.join(&name);
+    if std::fs::write(&lower, b"").is_err() {
+        return false;
+    }
+    let insensitive = tmp.join(name.to_uppercase()).exists();
+    let _ = std::fs::remove_file(&lower);
+    insensitive
+}
+
+/// Map a filesystem error from writing an object or one of its sidecars.
+/// Layout conflicts (a key that is also a "directory" of another key, such
+/// as `a` and `a/b`, or `k` and `k.json/x` for sidecars, or a name too long
+/// once suffixed) are client errors, not internal errors.
+pub(crate) fn path_conflict_error(e: std::io::Error) -> S3Error {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        NotADirectory | IsADirectory | AlreadyExists | DirectoryNotEmpty | InvalidFilename => {
+            S3Error::InvalidObjectKey
+        }
+        _ => S3Error::InternalError(e.to_string()),
+    }
+}
+
+/// Maximum number of `/`-separated components in an object key.
+pub const MAX_KEY_DEPTH: usize = 64;
+
 pub(crate) const INTERNAL_NAMES: &[&str] = &[
     ".metadata",
     ".meta",
@@ -289,7 +397,44 @@ mod tests {
         assert!(validate_object_key("file.txt").is_ok());
         assert!(validate_object_key("dir/nested/file.txt").is_ok());
         assert!(validate_object_key("a").is_ok());
-        assert!(validate_object_key("./file.txt").is_ok()); // single dot is ok
+        assert!(validate_object_key("dir/").is_ok()); // directory marker
+        assert!(validate_object_key("dir/sub/").is_ok());
+        assert!(validate_object_key(".hidden").is_ok());
+        assert!(validate_object_key("a/.policy.json").is_ok()); // nested: not internal
+        assert!(validate_object_key("a.b/c..d/...").is_ok()); // dots inside names
+    }
+
+    #[test]
+    fn test_internal_names_rejected_in_any_case() {
+        for key in [".METADATA", ".Policy.Json", ".META/x", ".Dir_Marker", "a/.DIR_MARKER/b"] {
+            assert!(validate_object_key(key).is_err(), "{key:?} must be rejected");
+        }
+        // Nested internal names are ordinary keys
+        assert!(validate_object_key("d/.meta").is_ok());
+    }
+
+    #[test]
+    fn test_non_canonical_keys_rejected() {
+        // Each of these resolves on disk to another key or to an internal
+        // file, while authorization would see the literal string.
+        for key in [
+            "./file.txt",
+            "./.policy.json",
+            "./.metadata",
+            ".//.policy.json",
+            "a/./b",
+            "a//b",
+            "a/b//",
+            "a/.",
+            "/abs",
+            "//x",
+            "/",
+            ".",
+            "./",
+            "x/./.meta/y.json",
+        ] {
+            assert!(validate_object_key(key).is_err(), "{key:?} must be rejected");
+        }
     }
 
     #[test]

@@ -376,7 +376,11 @@ pub async fn decrypt_file_to(
         let expected_cipher = expected_plain + TAG_SIZE;
         let n = read_exact_or_eof(&mut reader, &mut buf[..expected_cipher]).await?;
         if n == 0 {
-            break;
+            // Ciphertext shorter than the recorded plaintext size: the file
+            // was truncated. Never produce a shorter "valid" copy.
+            return Err(S3Error::InternalError(
+                "Encrypted object is truncated.".to_string(),
+            ));
         }
         let plaintext = decrypt_chunk(&cipher, base_nonce, chunk_index, &buf[..n])?;
         writer
@@ -473,10 +477,14 @@ pub fn build_decrypting_range_body(
                     Poll::Ready(Ok(())) => {
                         let filled_now = read_buf.filled().len();
                         if filled_now == filled_before {
-                            // EOF
+                            // EOF before the recorded plaintext size: truncated
+                            // ciphertext. Fail the body instead of ending it early.
                             this.done = true;
                             if filled_now == 0 {
-                                return Poll::Ready(None);
+                                return Poll::Ready(Some(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "encrypted object is truncated",
+                                ))));
                             }
                             break;
                         }
@@ -579,6 +587,49 @@ pub async fn encrypt_sse_c(
         customer_key_md5: Some(customer_key_md5.to_string()),
         plaintext_size,
     })
+}
+
+/// Encryption to apply to a new object before it is published.
+pub enum EncryptRequest {
+    SseS3 { master_key: [u8; 32] },
+    SseC { key: [u8; 32], key_md5: String },
+}
+
+impl EncryptRequest {
+    /// Build from a parsed SSE request; `None` when no encryption applies.
+    /// SSE-S3 without a configured master key is an error.
+    pub fn from_sse(
+        sse: &SseRequest,
+        config: Option<&EncryptionConfig>,
+    ) -> Result<Option<Self>, S3Error> {
+        match sse {
+            SseRequest::None => Ok(None),
+            SseRequest::SseS3 => {
+                let enc = config.ok_or(S3Error::ServerSideEncryptionConfigurationNotFoundError)?;
+                Ok(Some(Self::SseS3 {
+                    master_key: enc.master_key,
+                }))
+            }
+            SseRequest::SseC { key, key_md5 } => Ok(Some(Self::SseC {
+                key: *key,
+                key_md5: key_md5.clone(),
+            })),
+        }
+    }
+
+    /// Encrypt the file at `path` in place (through `scratch`). Callers pass
+    /// a temporary file that is not yet visible in a bucket, so plaintext is
+    /// never published, and remove it if this fails.
+    pub async fn apply(&self, path: &Path, scratch: &Path) -> Result<EncryptionMeta, S3Error> {
+        let result = match self {
+            Self::SseS3 { master_key } => encrypt_sse_s3(path, scratch, master_key).await,
+            Self::SseC { key, key_md5 } => encrypt_sse_c(path, scratch, key, key_md5).await,
+        };
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(scratch).await;
+        }
+        result
+    }
 }
 
 /// Resolve the decryption key for an encrypted object.

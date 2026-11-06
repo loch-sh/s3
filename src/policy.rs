@@ -12,7 +12,11 @@ pub struct BucketPolicy {
 }
 
 /// A single policy statement.
+/// Unknown fields (`Condition`, `NotAction`, `NotResource`, `NotPrincipal`...)
+/// are rejected: silently ignoring a `Condition` would turn a conditional
+/// Allow into an unconditional one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Statement {
     #[serde(rename = "Sid", skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
@@ -76,6 +80,12 @@ pub enum S3Action {
     DeleteObject,
     ListBucket,
     GetBucketLocation,
+    /// GET/HEAD with `versionId`
+    GetObjectVersion,
+    /// DELETE with `versionId` (permanent removal of a version)
+    DeleteObjectVersion,
+    /// `GET /bucket?versions`
+    ListBucketVersions,
 }
 
 impl S3Action {
@@ -87,15 +97,93 @@ impl S3Action {
             S3Action::DeleteObject => "s3:DeleteObject",
             S3Action::ListBucket => "s3:ListBucket",
             S3Action::GetBucketLocation => "s3:GetBucketLocation",
+            S3Action::GetObjectVersion => "s3:GetObjectVersion",
+            S3Action::DeleteObjectVersion => "s3:DeleteObjectVersion",
+            S3Action::ListBucketVersions => "s3:ListBucketVersions",
         }
     }
+
+    /// Policy action names that apply to this operation. Version operations
+    /// also answer to their base action: an `Allow s3:GetObject` keeps
+    /// granting version reads (compatibility), while a `Deny` on either
+    /// name applies.
+    pub fn policy_names(&self) -> &'static [&'static str] {
+        match self {
+            S3Action::GetObjectVersion => &["s3:GetObjectVersion", "s3:GetObject"],
+            S3Action::DeleteObjectVersion => &["s3:DeleteObjectVersion", "s3:DeleteObject"],
+            S3Action::ListBucketVersions => &["s3:ListBucketVersions", "s3:ListBucket"],
+            S3Action::GetObject => &["s3:GetObject"],
+            S3Action::PutObject => &["s3:PutObject"],
+            S3Action::DeleteObject => &["s3:DeleteObject"],
+            S3Action::ListBucket => &["s3:ListBucket"],
+            S3Action::GetBucketLocation => &["s3:GetBucketLocation"],
+        }
+    }
+}
+
+/// Case-insensitive match of an IAM action pattern (`*` and `?` wildcards),
+/// as AWS does: `*`, `s3:*`, `s3:Get*`, `s3:getobject` all match `s3:GetObject`.
+/// Iterative two-pointer matcher: O(len(pattern) * len(name)) in the worst
+/// case, whatever the number of wildcards (no backtracking blow-up).
+fn action_pattern_matches(pattern: &str, name: &str) -> bool {
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&b| b == b'*')
+}
+
+/// Longest accepted action pattern (AWS action names are short).
+const MAX_ACTION_PATTERN_LEN: usize = 128;
+
+/// A policy action must be `*` or an `s3:` action name (wildcards allowed).
+fn is_valid_action_pattern(pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.len() > MAX_ACTION_PATTERN_LEN {
+        return false;
+    }
+    let Some(name) = pattern
+        .get(..3)
+        .filter(|p| p.eq_ignore_ascii_case("s3:"))
+        .map(|_| &pattern[3..])
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'*' || b == b'?')
 }
 
 impl BucketPolicy {
     /// Check if a given action on a given resource is allowed for anonymous access.
     /// Returns true if at least one statement explicitly allows AND no statement denies.
     pub fn is_allowed_for_anonymous(&self, action: S3Action, resource: &str) -> bool {
-        let mut allowed = false;
+        self.anonymous_decision(action, resource) == Some(true)
+    }
+
+    /// Policy decision for an anonymous request: `Some(false)` on an explicit
+    /// Deny, `Some(true)` on an Allow without Deny, `None` when no statement
+    /// matches (other grants such as ACLs may then apply, but never override
+    /// an explicit Deny).
+    pub fn anonymous_decision(&self, action: S3Action, resource: &str) -> Option<bool> {
+        let mut allowed = None;
 
         for statement in &self.statement {
             if !statement.is_principal_wildcard() {
@@ -111,8 +199,8 @@ impl BucketPolicy {
             }
 
             match statement.effect {
-                Effect::Deny => return false,
-                Effect::Allow => allowed = true,
+                Effect::Deny => return Some(false),
+                Effect::Allow => allowed = Some(true),
             }
         }
 
@@ -180,12 +268,16 @@ impl Statement {
     }
 
     fn matches_action(&self, action: S3Action) -> bool {
-        let action_str = action.as_str();
         let actions: Vec<&str> = match &self.action {
             ActionSet::Single(s) => vec![s.as_str()],
             ActionSet::Multiple(v) => v.iter().map(|s| s.as_str()).collect(),
         };
-        actions.iter().any(|a| *a == "s3:*" || *a == action_str)
+        actions.iter().any(|pattern| {
+            action
+                .policy_names()
+                .iter()
+                .any(|name| action_pattern_matches(pattern, name))
+        })
     }
 
     fn matches_resource(&self, resource: &str) -> bool {
@@ -226,12 +318,40 @@ pub fn parse_policy(json_bytes: &[u8]) -> Result<BucketPolicy, S3Error> {
         return Err(S3Error::MalformedPolicy);
     }
 
+    // An invalid action (other service, stray characters) is refused rather
+    // than silently never matching (a Deny that does nothing)
+    for statement in &policy.statement {
+        let actions: Vec<&str> = match &statement.action {
+            ActionSet::Single(s) => vec![s.as_str()],
+            ActionSet::Multiple(v) => v.iter().map(|s| s.as_str()).collect(),
+        };
+        if actions.is_empty() || !actions.iter().all(|a| is_valid_action_pattern(a)) {
+            return Err(S3Error::MalformedPolicy);
+        }
+    }
+
     Ok(policy)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_action_pattern_matching() {
+        for p in ["*", "s3:*", "s3:Get*", "s3:getobject", "S3:GETOBJECT", "s3:Get?bject", "s3:*Object"] {
+            assert!(action_pattern_matches(p, "s3:GetObject"), "{p}");
+        }
+        for p in ["s3:Put*", "s3:GetObjectX", "s3:Get", "iam:*", "s3:?"] {
+            assert!(!action_pattern_matches(p, "s3:GetObject"), "{p}");
+        }
+        // Pathological pattern: bounded time, no deep recursion
+        let evil = format!("s3:{}Z", "*".repeat(100_000));
+        let started = std::time::Instant::now();
+        assert!(!action_pattern_matches(&evil, "s3:GetObject"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!is_valid_action_pattern(&evil));
+    }
 
     #[test]
     fn test_parse_valid_policy() {

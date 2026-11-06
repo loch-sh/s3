@@ -28,6 +28,23 @@ use users::UserStore;
 /// Maximum time for an HTTP/1 client to send the request headers.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default cap on concurrent client connections (`S3_MAX_CONNECTIONS`).
+/// Connections beyond the cap are closed right after accept.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// HTTP/2 keep-alive: ping idle connections, drop those that stop answering.
+const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+const H2_MAX_CONCURRENT_STREAMS: u32 = 128;
+
+fn max_connections() -> usize {
+    std::env::var("S3_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+}
+
 /// Server configuration shared across all connections.
 pub struct ServerConfig {
     pub storage: Arc<Storage>,
@@ -54,6 +71,7 @@ pub async fn serve_with_shutdown(
 ) {
     let graceful = GracefulShutdown::new();
     tokio::pin!(shutdown);
+    let permits = Arc::new(tokio::sync::Semaphore::new(max_connections()));
 
     loop {
         let (stream, _) = tokio::select! {
@@ -61,31 +79,54 @@ pub async fn serve_with_shutdown(
                 Ok(conn) => conn,
                 Err(e) => {
                     eprintln!("Failed to accept connection: {}", e);
+                    // e.g. EMFILE: back off instead of spinning on the error
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             },
             _ = &mut shutdown => break,
         };
 
-        let config = config.clone();
-        let io = TokioIo::new(stream);
-        let service = service_fn(move |req| {
-            let config = config.clone();
-            router::route(req, config)
-        });
+        // Bounded number of concurrent connections: over the cap, close now
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
 
-        // Auto-negotiate HTTP/1.1 or HTTP/2 based on ALPN.
-        // HTTP/1 clients must send their request headers within HEADER_READ_TIMEOUT
-        // (slowloris protection); stalled bodies are cut by the storage layer.
-        let mut builder = auto::Builder::new(TokioExecutor::new());
-        builder
-            .http1()
-            .timer(TokioTimer::new())
-            .header_read_timeout(HEADER_READ_TIMEOUT);
-        let conn = builder.serve_connection(io, service).into_owned();
-        let conn = graceful.watch(conn);
+        let config = config.clone();
+        let watcher = graceful.watcher();
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
+            let _permit = permit;
+            // A client that connects and never sends a byte is dropped
+            // (hyper's header timer only starts once the protocol is known)
+            // (peek waits for real data; readiness alone can be spurious)
+            let mut first = [0u8; 1];
+            match tokio::time::timeout(HEADER_READ_TIMEOUT, stream.peek(&mut first)).await {
+                Ok(Ok(n)) if n > 0 => {}
+                _ => return,
+            }
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req| {
+                let config = config.clone();
+                router::route(req, config)
+            });
+
+            // Auto-negotiate HTTP/1.1 or HTTP/2 (prior knowledge / h2c).
+            // HTTP/1 clients must send their request headers within HEADER_READ_TIMEOUT
+            // (slowloris protection); stalled bodies are cut by the storage layer.
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL)
+                .keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT)
+                .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+            let conn = builder.serve_connection(io, service);
+            if let Err(e) = watcher.watch(conn.into_owned()).await {
                 eprintln!("Connection error: {}", e);
             }
         });

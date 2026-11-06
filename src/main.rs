@@ -231,6 +231,8 @@ fn load_app_config() -> Result<AppConfig, String> {
     let max_storage_bytes = parse_env_opt_u64("S3_MAX_STORAGE_BYTES")?;
     let shutdown_grace_secs = parse_env_u64("S3_SHUTDOWN_GRACE", DEFAULT_SHUTDOWN_GRACE_SECS)?;
     let init_buckets = parse_init_buckets()?;
+    // Read by the storage layer; validated here so a typo fails at startup
+    let _ = parse_env_u64("S3_MIN_UPLOAD_RATE", 4096)?;
 
     Ok(AppConfig {
         port,
@@ -359,6 +361,14 @@ async fn run() {
             .unwrap_or((0, 0));
     if stale_count > 0 {
         eprintln!("Removed {stale_count} stale temporary file(s) ({stale_bytes} bytes)");
+    }
+    if s3::storage::is_case_insensitive(&storage.data_dir) {
+        eprintln!(
+            "WARNING: the data directory is on a case-insensitive filesystem (macOS, Windows, \
+             Docker Desktop bind mount). Object keys that differ only by case share one file, \
+             and bucket policies match keys case-sensitively, so a Deny on 'secret/*' does not \
+             cover 'Secret/x'. Use a case-sensitive filesystem in production."
+        );
     }
 
     // Create S3_INIT_BUCKETS (owned by the root user) when they do not exist yet

@@ -17,7 +17,7 @@ pub async fn put_bucket_versioning(
     bucket: &str,
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
-    let body = match read_body_limited(req.into_body(), 4 * 1024).await {
+    let body = match read_body_limited(req, 4 * 1024).await {
         Ok(data) => data,
         Err(e) => return error_response(e, &format!("/{}", bucket)),
     };

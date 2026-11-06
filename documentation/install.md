@@ -150,6 +150,8 @@ All configuration is done via environment variables. No configuration file is re
 | `S3_INIT_BUCKETS` | _(none)_ | Comma-separated buckets created at startup if missing, owned by the root user. Invalid name: startup fails |
 | `S3_SHUTDOWN_GRACE` | `8` | Seconds granted to in-flight requests after `SIGTERM`/`SIGINT` |
 | `S3_MAX_BLOCKING_THREADS` | `32` | Cap on the blocking thread pool used for file I/O (keep below the container PID limit) |
+| `S3_MAX_CONNECTIONS` | `1024` | Maximum concurrent client connections; extra connections are closed right after accept |
+| `S3_MIN_UPLOAD_RATE` | `4096` | Minimum upload rate in bytes/s, checked over successive windows of at least 60 s (slower uploads are aborted, releasing their quota reservation); `0` disables. Invalid values make the server exit with status 1 |
 
 **Notes:**
 

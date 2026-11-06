@@ -6,10 +6,12 @@ pub enum S3Error {
     NoSuchBucket,
     NoSuchKey,
     BucketAlreadyExists,
+    BucketAlreadyOwnedByYou,
     BucketNotEmpty,
     InvalidBucketName,
     AccessDenied,
     SignatureDoesNotMatch,
+    XAmzContentSHA256Mismatch,
     NoSuchBucketPolicy,
     NoSuchCORSConfiguration,
     MalformedPolicy,
@@ -49,6 +51,11 @@ impl S3Error {
                 "The specified key does not exist.",
             ),
             S3Error::BucketAlreadyExists => (
+                "BucketAlreadyExists",
+                StatusCode::CONFLICT,
+                "The requested bucket name is not available. Please select a different name and try again.",
+            ),
+            S3Error::BucketAlreadyOwnedByYou => (
                 "BucketAlreadyOwnedByYou",
                 StatusCode::CONFLICT,
                 "Your previous request to create the named bucket succeeded and you already own it.",
@@ -123,6 +130,11 @@ impl S3Error {
                 "InvalidRange",
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "The requested range is not satisfiable",
+            ),
+            S3Error::XAmzContentSHA256Mismatch => (
+                "XAmzContentSHA256Mismatch",
+                StatusCode::BAD_REQUEST,
+                "The provided 'x-amz-content-sha256' header does not match what was computed.",
             ),
             S3Error::RequestTimeout => (
                 "RequestTimeout",

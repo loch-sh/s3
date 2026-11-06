@@ -9,7 +9,7 @@ use tokio_util::io::ReaderStream;
 
 use super::{BoxBody, empty_response, error_response, full_body, xml_response};
 use crate::ServerConfig;
-use crate::encryption::{self, EncryptionMeta, SseAlgorithm, SseRequest};
+use crate::encryption::{self, EncryptRequest, EncryptionMeta, SseAlgorithm, SseRequest};
 use crate::error::S3Error;
 use crate::storage::bucket::format_system_time;
 use crate::storage::object::{ObjectMetadata, StoredMetadata};
@@ -19,6 +19,10 @@ use crate::xml;
 
 /// AWS S3 limit for user-defined metadata (sum of all key + value lengths).
 const MAX_USER_METADATA_BYTES: usize = 2048;
+/// Total size of the standard headers stored in the sidecar (content-type,
+/// cache-control, content-disposition, content-encoding, content-language,
+/// expires): bounds the per-object sidecar size.
+const MAX_SYSTEM_METADATA_BYTES: usize = 8192;
 
 /// Extract S3 metadata headers from the request.
 /// Returns `EntityTooLarge` if `x-amz-meta-*` headers exceed 2 KB in total.
@@ -37,7 +41,16 @@ fn extract_metadata(req: &Request<Incoming>) -> Result<StoredMetadata, S3Error> 
                 if meta_total > MAX_USER_METADATA_BYTES {
                     return Err(S3Error::EntityTooLarge);
                 }
-                user_metadata.insert(meta_key.to_string(), v.to_string());
+                // A repeated header would be stored with a value the
+                // signature does not cover (only the first one is signed)
+                if user_metadata
+                    .insert(meta_key.to_string(), v.to_string())
+                    .is_some()
+                {
+                    return Err(S3Error::InvalidArgument(format!(
+                        "Duplicate metadata header x-amz-meta-{meta_key}."
+                    )));
+                }
             }
         }
     }
@@ -60,13 +73,33 @@ fn extract_metadata(req: &Request<Incoming>) -> Result<StoredMetadata, S3Error> 
         })
         .filter(|v| !v.is_empty());
 
+    let content_type = get_header("content-type");
+    let cache_control = get_header("cache-control");
+    let content_disposition = get_header("content-disposition");
+    let content_language = get_header("content-language");
+    let expires = get_header("expires");
+    let system_total: usize = [
+        &content_type,
+        &cache_control,
+        &content_disposition,
+        &content_encoding,
+        &content_language,
+        &expires,
+    ]
+    .iter()
+    .map(|v| v.as_ref().map_or(0, |s| s.len()))
+    .sum();
+    if system_total > MAX_SYSTEM_METADATA_BYTES {
+        return Err(S3Error::EntityTooLarge);
+    }
+
     Ok(StoredMetadata {
-        content_type: get_header("content-type"),
-        cache_control: get_header("cache-control"),
-        content_disposition: get_header("content-disposition"),
+        content_type,
+        cache_control,
+        content_disposition,
         content_encoding,
-        content_language: get_header("content-language"),
-        expires: get_header("expires"),
+        content_language,
+        expires,
         user_metadata,
         encryption: None,
         etag: None,
@@ -309,64 +342,31 @@ pub async fn put_object(
     if let Err(e) = reservation.ensure(declared) {
         return error_response(e, &resource);
     }
-    let body = req.into_body();
-
-    // Stream body to disk (plaintext) with MD5
-    let etag = match storage
-        .put_object(bucket, key, body, aws_chunked, reservation)
-        .await
-    {
-        Ok(etag) => etag,
+    let encrypt = match EncryptRequest::from_sse(&sse_request, config.encryption.as_ref()) {
+        Ok(e) => e,
         Err(e) => return error_response(e, &resource),
     };
+    let check = super::payload_check(&req);
+    let body = req.into_body();
 
-    // Encrypt if requested
-    let encryption_meta = match sse_request {
-        SseRequest::None => None,
-        SseRequest::SseS3 => {
-            let enc_config = config.encryption.as_ref().unwrap();
-            let object_path = match storage.object_path(bucket, key) {
-                Ok(p) => p,
-                Err(e) => return error_response(e, &resource),
-            };
-            match encryption::encrypt_sse_s3(
-                &object_path,
-                &storage.tmp_file(),
-                &enc_config.master_key,
-            )
-            .await
-            {
-                Ok(meta) => Some(meta),
-                Err(e) => return error_response(e, &resource),
-            }
-        }
-        SseRequest::SseC {
-            key: ref cust_key,
-            ref key_md5,
-        } => {
-            let object_path = match storage.object_path(bucket, key) {
-                Ok(p) => p,
-                Err(e) => return error_response(e, &resource),
-            };
-            match encryption::encrypt_sse_c(&object_path, &storage.tmp_file(), cust_key, key_md5)
-                .await
-            {
-                Ok(meta) => Some(meta),
-                Err(e) => return error_response(e, &resource),
-            }
-        }
+    // Stream the body to a temporary file (MD5 of the plaintext), encrypt it
+    // there if requested, then publish it under the object path
+    let (etag, encryption_meta) = match storage
+        .put_object(
+            bucket,
+            key,
+            body,
+            aws_chunked,
+            check,
+            encrypt.as_ref(),
+            metadata,
+            reservation,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error_response(e, &resource),
     };
-
-    // Store encryption metadata and plaintext ETag
-    metadata.encryption = encryption_meta.clone();
-    if encryption_meta.is_some() {
-        metadata.etag = Some(etag.clone());
-    }
-
-    // Persist object metadata sidecar
-    if let Err(e) = storage.put_object_metadata(bucket, key, &metadata).await {
-        return error_response(e, &resource);
-    }
 
     // Check versioning status and store version if needed
     let versioning = storage
@@ -1171,10 +1171,10 @@ pub async fn copy_object(
         Ok(p) => p,
         Err(e) => return error_response(e, &resource),
     };
-    if let Some(parent) = dst_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return error_response(S3Error::InternalError(e.to_string()), &resource);
-        }
+    if let Some(parent) = dst_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return error_response(crate::storage::path_conflict_error(e), &resource);
     }
 
     // Reserve quota for the copy (plaintext size; doubled when the destination keeps versions)
@@ -1252,39 +1252,23 @@ pub async fn copy_object(
         }
     };
 
-    // Atomic rename to destination
-    {
-        let _path_guard = storage.quota.lock_path(&dst_path).await;
-        let copied = crate::quota::file_size(&tmp_path).await;
-        let replaced = crate::quota::file_size(&dst_path).await;
-        if let Err(e) = crate::storage::rename_into(&tmp_path, &dst_path).await {
+    // Encrypt the destination while it is still a private temporary file
+    let dst_encrypt = match EncryptRequest::from_sse(&dst_sse, config.encryption.as_ref()) {
+        Ok(e) => e,
+        Err(e) => {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-            return error_response(S3Error::InternalError(e.to_string()), &resource);
+            return error_response(e, &resource);
         }
-        // With versioning, the factor-2 reservation covers the version copy
-        reservation.commit(copied);
-        storage.quota.release(replaced);
-    }
-
-    // Encrypt destination if requested
-    let dst_enc_meta = match dst_sse {
-        SseRequest::None => None,
-        SseRequest::SseS3 => {
-            let enc_config = config.encryption.as_ref().unwrap();
-            match encryption::encrypt_sse_s3(&dst_path, &storage.tmp_file(), &enc_config.master_key)
-                .await
-            {
-                Ok(meta) => Some(meta),
-                Err(e) => return error_response(e, &resource),
-            }
-        }
-        SseRequest::SseC {
-            ref key,
-            ref key_md5,
-        } => match encryption::encrypt_sse_c(&dst_path, &storage.tmp_file(), key, key_md5).await {
+    };
+    let dst_enc_meta = match dst_encrypt {
+        Some(req) => match req.apply(&tmp_path, &storage.tmp_file()).await {
             Ok(meta) => Some(meta),
-            Err(e) => return error_response(e, &resource),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return error_response(e, &resource);
+            }
         },
+        None => None,
     };
 
     // Build destination metadata
@@ -1297,16 +1281,22 @@ pub async fn copy_object(
         m.etag = None;
         m
     };
-
     dst_metadata.encryption = dst_enc_meta.clone();
-    if dst_metadata.encryption.is_some() {
-        dst_metadata.etag = Some(etag.clone());
-    }
+    dst_metadata.etag = Some(etag.clone());
     dst_metadata.owner = owner.map(|s| s.to_string());
 
-    let _ = storage
-        .put_object_metadata(bucket, key, &dst_metadata)
-        .await;
+    // Publish data and sidecar together (sidecar first)
+    match storage
+        .publish_object(bucket, key, &dst_path, &tmp_path, &dst_metadata)
+        .await
+    {
+        Ok((copied, replaced)) => {
+            // With versioning, the factor-2 reservation covers the version copy
+            reservation.commit(copied);
+            storage.quota.release(replaced);
+        }
+        Err(e) => return error_response(e, &resource),
+    }
 
     let file_meta = match tokio::fs::symlink_metadata(&dst_path).await {
         Ok(m) => m,

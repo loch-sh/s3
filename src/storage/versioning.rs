@@ -160,10 +160,19 @@ impl Storage {
     // -- Path helpers --
 
     /// Path to the versions directory for a given key within a bucket.
+    /// A directory-marker key (`pub/`) gets `.versions/pub/.dir_marker/`, like
+    /// its data file: `Path::join` would otherwise drop the trailing slash and
+    /// share `.versions/pub/` with the different key `pub`.
     fn versions_key_dir(&self, bucket: &str, key: &str) -> Result<PathBuf, S3Error> {
         super::validate_object_key(key)?;
         let bucket_dir = self.safe_bucket_path(bucket)?;
-        let path = bucket_dir.join(VERSIONS_DIR).join(key);
+        let path = match key.strip_suffix('/') {
+            Some(dir) => bucket_dir
+                .join(VERSIONS_DIR)
+                .join(dir)
+                .join(super::DIR_MARKER),
+            None => bucket_dir.join(VERSIONS_DIR).join(key),
+        };
         super::assert_path_within(&path, &bucket_dir)?;
         Ok(path)
     }
@@ -216,6 +225,8 @@ impl Storage {
         vid: &str,
     ) -> Result<(), S3Error> {
         validate_version_id(vid)?;
+        // A delete marker is a write: refused once the quota is reached
+        self.quota.check_not_exceeded()?;
         let ver_dir = self.versions_key_dir(bucket, key)?;
         fs::create_dir_all(&ver_dir)
             .await
@@ -244,6 +255,8 @@ impl Storage {
         fs::write(&meta_path, &meta_json)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        // Counted right away (not only at the next recount)
+        self.quota.add(meta_json.len() as u64);
 
         Ok(())
     }
@@ -533,12 +546,19 @@ impl Storage {
         .await?;
 
         for key in unversioned_keys {
+            // Filter before touching the file (the prefix filter below only
+            // applies to the collected entries)
+            if !key.starts_with(prefix) {
+                continue;
+            }
             let object_path = match self.object_path(bucket, &key) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
             if let Ok(file_meta) = fs::symlink_metadata(&object_path).await {
-                let etag = compute_file_md5(&object_path).await.unwrap_or_default();
+                let (etag, size) = self
+                    .listed_etag_and_size(bucket, &key, &object_path, file_meta.len())
+                    .await;
                 let last_modified = file_meta
                     .modified()
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -548,7 +568,7 @@ impl Storage {
                     is_delete_marker: false,
                     last_modified: format_system_time(last_modified),
                     etag,
-                    size: file_meta.len(),
+                    size,
                     is_latest: true,
                 });
             }
@@ -733,11 +753,7 @@ async fn collect_version_entries(
 
     // If this directory has version files, derive the key from relative path
     if has_versions {
-        let key = current
-            .strip_prefix(base)
-            .unwrap_or(Path::new(""))
-            .to_string_lossy()
-            .to_string();
+        let key = key_from_relative_path(current.strip_prefix(base).unwrap_or(Path::new("")));
 
         for (vid, is_marker) in &version_files {
             let meta_path = current.join(format!("{}.meta", vid));
@@ -792,8 +808,8 @@ async fn collect_unversioned_keys(
     {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip internal files
-        if INTERNAL_NAMES.contains(&name.as_str()) {
+        // Skip internal files (bucket root only, see collect_keys)
+        if current == bucket_base && INTERNAL_NAMES.contains(&name.as_str()) {
             continue;
         }
 
@@ -817,9 +833,10 @@ async fn collect_unversioned_keys(
             .await?;
         } else if meta.is_file() {
             if let Ok(relative) = path.strip_prefix(bucket_base) {
-                let key = relative.to_string_lossy().to_string();
-                // Check if this key has a versions directory
-                let ver_dir = versions_root.join(&key);
+                // Check if this key has a versions directory (same relative
+                // path, `.dir_marker` included for directory markers)
+                let ver_dir = versions_root.join(relative);
+                let key = key_from_relative_path(relative);
                 if !is_real_dir(&ver_dir).await {
                     keys.push(key);
                 }
@@ -828,6 +845,22 @@ async fn collect_unversioned_keys(
     }
 
     Ok(())
+}
+
+/// Object key for a path relative to the bucket (or versions) root: a final
+/// `.dir_marker` component stands for a directory-marker key ending in `/`.
+fn key_from_relative_path(relative: &Path) -> String {
+    let rel = relative.to_string_lossy();
+    match rel.strip_suffix(super::DIR_MARKER) {
+        Some(dir) if dir.is_empty() || dir.ends_with('/') => {
+            if dir.is_empty() {
+                String::new()
+            } else {
+                dir.to_string()
+            }
+        }
+        _ => rel.to_string(),
+    }
 }
 
 /// Check if a directory is empty.

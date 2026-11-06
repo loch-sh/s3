@@ -199,12 +199,16 @@ impl Quota {
     }
 
     /// Background task: recount whenever the counter is marked dirty, at most
-    /// once per `RECOUNT_DEBOUNCE`.
+    /// once per `RECOUNT_DEBOUNCE`. After each walk the worker also pauses
+    /// for 4x the walk duration, so DELETE floods on a large data directory
+    /// cannot keep a blocking thread and the disk busy (at most ~20%).
     pub async fn run_recount_worker(self: Arc<Self>, data_dir: PathBuf) {
         loop {
             self.dirty.notified().await;
             tokio::time::sleep(RECOUNT_DEBOUNCE).await;
+            let started = std::time::Instant::now();
             self.recount(&data_dir).await;
+            tokio::time::sleep(started.elapsed().saturating_mul(4)).await;
         }
     }
 }

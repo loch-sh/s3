@@ -142,7 +142,7 @@ chmod 0400 /srv/tenant-a/secrets/master.key
 - `S3_ENCRYPTION_KEY_FILE` holds the base64 key, with or without a trailing newline. Startup fails (exit 1) if the file is missing, unreadable or invalid, or if `S3_ENCRYPTION_KEY` is also set. The key is never logged.
 - `S3_ENCRYPT_BY_DEFAULT=true` encrypts every write that carries no SSE header: `PutObject`, `CopyObject`, `CompleteMultipartUpload`, and the copies stored as versions. Responses carry `x-amz-server-side-encryption: AES256`. SSE-C headers sent by the client still take precedence. Without a key, startup fails (exit 1).
 - Objects written before the flag was turned on stay in plaintext and remain readable; they are encrypted when rewritten (for example by copying an object onto itself).
-- Encryption happens once the payload is on disk: a `PutObject` body is written, then encrypted in place, and multipart parts stay in plaintext in `.uploads/` until `CompleteMultipartUpload`. A crash in between can leave plaintext behind. The guarantee is "encrypted at rest once the write has completed", not "never written in plaintext".
+- Since 1.4.1, an upload is written and encrypted in a temporary file under `/data/.loch-tmp/` (removed at startup), then published: plaintext never appears under a bucket, even after a crash or an error. Multipart parts stay in plaintext in `.uploads/` until `CompleteMultipartUpload`.
 - Losing the key makes every SSE-S3 object unreadable: back it up separately from the data.
 - With an empty named volume, Docker copies the image's `/data` (owned by `100:101`) on first mount. When forcing another uid with `--user`, either use a bind mount or `volume-nocopy`, or chown after the first mount.
 
@@ -224,13 +224,17 @@ On `SIGTERM` (container stop) or `SIGINT`, the server stops accepting connection
 
 | Item | Limit |
 |------|-------|
+| Connections | At most `S3_MAX_CONNECTIONS` (default 1024) at once; extra connections are closed right away. A connection that sends nothing within 30 s is closed |
 | Request headers (HTTP/1) | Must be received within 30 s |
-| Upload body | Aborted after 60 s without data (`400 RequestTimeout`) |
+| HTTP/2 | Keep-alive ping every 30 s (dropped after 20 s without answer), 128 concurrent streams per connection |
+| Upload body | Aborted after 60 s without data, or when less than 4 KiB/s arrives over a 60 s window (`400 RequestTimeout`; `S3_MIN_UPLOAD_RATE` in bytes/s, `0` disables) |
+| Stored headers | `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Expires`: 8 KiB in total (`413 EntityTooLarge`); object ACL body 16 KiB |
 | Object size (PutObject, UploadPart) | No server limit other than the quota and disk space; the body is streamed to disk |
 | Multipart upload | Parts are numbered by the client; no server limit on part size or count; parts expire after `S3_UPLOAD_TTL` (default 24 h) |
 | XML/JSON request bodies | Read in memory with a per-endpoint limit: bucket policy 20 KiB; CORS, ACL, encryption and versioning configurations 64 KiB; `CompleteMultipartUpload` 10 MB. Beyond: `413 EntityTooLarge` |
 | User metadata (`x-amz-meta-*`) | 2 048 bytes in total (AWS limit), `EntityTooLarge` (413) beyond |
-| Object key | 1 024 bytes |
+| Object key | 1 024 bytes, at most 64 `/`-separated components; `.`, `..` and empty components are rejected (`400 InvalidObjectKey`), except a single trailing `/`. Keys written by older versions with `//` or `./` are stored under their normalized path and reachable only through it. A key that is also the "directory" of another key (`a` and `a/b`, `k` and `k.json/x`) is refused with `400 InvalidObjectKey` |
+| Filesystem | The data directory must be case-sensitive (Linux ext4/xfs/overlayfs): on a case-insensitive one (macOS, Windows, Docker Desktop bind mounts) keys differing only by case share one file and policy prefixes can be bypassed; the server logs a warning at startup |
 | aws-chunked chunk header line | 4 096 bytes |
 | Presigned URL expiry | 1 s to 7 days |
 

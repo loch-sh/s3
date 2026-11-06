@@ -3,6 +3,7 @@ use std::sync::Arc;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use subtle::ConstantTimeEq;
 
 use super::{BoxBody, empty_response, error_response, json_response, read_body_limited};
@@ -81,11 +82,10 @@ pub async fn route_users_api(
         .unwrap_or("");
 
     let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
-    // Constant-time comparison — the reference key is server-side only, length is not a secret
-    if token.is_empty()
-        || token.len() != api_key.len()
-        || !bool::from(token.as_bytes().ct_eq(api_key.as_bytes()))
-    {
+    // Compare SHA-256 digests in constant time: neither the content nor the
+    // length of the admin key leaks through timing
+    let digest = |s: &str| sha2::Sha256::digest(s.as_bytes());
+    if token.is_empty() || !bool::from(digest(token).as_slice().ct_eq(digest(api_key).as_slice())) {
         return error_response(S3Error::AccessDenied, path);
     }
 
@@ -142,7 +142,7 @@ pub async fn route_users_api(
 
         // PUT /_loch/users/{user_id} — Create or update a user
         (&Method::PUT, Some(uid)) => {
-            let body = match read_body_limited(req.into_body(), 64 * 1024).await {
+            let body = match read_body_limited(req, 64 * 1024).await {
                 Ok(b) => b,
                 Err(e) => return error_response(e, path),
             };

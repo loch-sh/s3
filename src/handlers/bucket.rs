@@ -3,6 +3,7 @@ use std::sync::Arc;
 use hyper::{Response, StatusCode};
 
 use super::{BoxBody, empty_response, error_response, full_body, xml_response};
+use crate::error::S3Error;
 use crate::policy::S3Action;
 use crate::storage::Storage;
 use crate::storage::bucket::format_system_time;
@@ -23,6 +24,17 @@ pub async fn create_bucket(
                 .header("Location", location)
                 .body(full_body(bytes::Bytes::new()))
                 .unwrap()
+        }
+        // Only the owner learns that it already owns the bucket; anyone else
+        // gets the generic "name not available"
+        Err(S3Error::BucketAlreadyExists) => {
+            let existing_owner = storage.get_bucket_owner(bucket).await.ok().flatten();
+            let err = if existing_owner.as_deref() == owner {
+                S3Error::BucketAlreadyOwnedByYou
+            } else {
+                S3Error::BucketAlreadyExists
+            };
+            error_response(err, &format!("/{}", bucket))
         }
         Err(e) => error_response(e, &format!("/{}", bucket)),
     }

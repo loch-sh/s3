@@ -2,5 +2,9 @@ localhost {
 	tls internal {
 		protocols tls1.2 tls1.3
 	}
+	# The user management API is protected by S3_ADMIN_API_KEY only: keep it
+	# off the internet (remove these two lines to manage users remotely)
+	@admin path /_loch/users /_loch/users/*
+	respond @admin 403
 	reverse_proxy s3:8080
 }

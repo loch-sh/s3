@@ -162,6 +162,8 @@ impl UserStore {
             }
         }
 
+        let snapshot = (self.by_user_id.clone(), self.by_access_key.clone());
+
         // If updating, remove old access key mapping
         if let Some(old) = self.by_user_id.get(&record.user_id) {
             self.by_access_key.remove(&old.access_key_id);
@@ -171,8 +173,7 @@ impl UserStore {
             .insert(record.access_key_id.clone(), record.clone());
         self.by_user_id.insert(record.user_id.clone(), record);
 
-        self.save_to_file().await?;
-        Ok(())
+        self.save_or_rollback(snapshot).await
     }
 
     /// Delete a user by user_id. Cannot delete root. Persists to file.
@@ -192,10 +193,24 @@ impl UserStore {
         }
 
         let access_key = record.access_key_id.clone();
+        let snapshot = (self.by_user_id.clone(), self.by_access_key.clone());
         self.by_user_id.remove(user_id);
         self.by_access_key.remove(&access_key);
 
-        self.save_to_file().await?;
+        self.save_or_rollback(snapshot).await
+    }
+
+    /// Persist the change; if the file cannot be written, restore the previous
+    /// in-memory state so that what is live always matches what is on disk
+    /// (a failed API call must not leave a credential active or revoked).
+    async fn save_or_rollback(
+        &mut self,
+        snapshot: (HashMap<String, UserRecord>, HashMap<String, UserRecord>),
+    ) -> Result<(), S3Error> {
+        if let Err(e) = self.save_to_file().await {
+            (self.by_user_id, self.by_access_key) = snapshot;
+            return Err(e);
+        }
         Ok(())
     }
 

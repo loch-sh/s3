@@ -5,10 +5,12 @@ use std::time::SystemTime;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{INTERNAL_NAMES, Storage, guess_content_type, is_regular_file};
+use crate::auth::PayloadCheck;
 use crate::encryption::EncryptionMeta;
 use crate::error::S3Error;
 use crate::quota::{Reservation, file_size};
@@ -89,15 +91,18 @@ impl Storage {
         key: &str,
         body: Incoming,
         aws_chunked: bool,
+        check: PayloadCheck,
+        encrypt: Option<&crate::encryption::EncryptRequest>,
+        mut metadata: StoredMetadata,
         mut reservation: Reservation,
-    ) -> Result<String, S3Error> {
+    ) -> Result<(String, Option<EncryptionMeta>), S3Error> {
         self.head_bucket(bucket).await?;
 
         let object_path = self.object_path(bucket, key)?;
         if let Some(parent) = object_path.parent() {
             fs::create_dir_all(parent)
                 .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                .map_err(super::path_conflict_error)?;
         }
 
         // UUID-based temp file to prevent TOCTOU race conditions
@@ -106,29 +111,124 @@ impl Storage {
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
-        let (etag, written) =
-            match stream_body_to_file(&mut file, body, aws_chunked, &mut reservation).await {
-                Ok(r) => r,
+        let (etag, _written) = match stream_body_to_file(
+            &mut file,
+            body,
+            aws_chunked,
+            check,
+            &mut reservation,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                drop(file);
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(e);
+            }
+        };
+        drop(file);
+
+        // Encrypt while the file is still a private temporary: plaintext is
+        // never published under the object path, even on crash or error.
+        let encryption = match encrypt {
+            Some(req) => match req.apply(&tmp_path, &self.tmp_file()).await {
+                Ok(meta) => Some(meta),
                 Err(e) => {
-                    drop(file);
                     let _ = fs::remove_file(&tmp_path).await;
                     return Err(e);
                 }
-            };
-        drop(file);
+            },
+            None => None,
+        };
+        metadata.encryption = encryption.clone();
+        // Stored for every object: listings and HEAD never re-read the data
+        metadata.etag = Some(etag.clone());
+        let (stored, replaced) = self
+            .publish_object(bucket, key, &object_path, &tmp_path, &metadata)
+            .await?;
+        // Ciphertext is slightly larger than the payload (GCM tags)
+        reservation.commit(stored);
+        self.quota.release(replaced);
 
-        {
-            let _path_guard = self.quota.lock_path(&object_path).await;
-            let replaced = file_size(&object_path).await;
-            if let Err(e) = crate::storage::rename_into(&tmp_path, &object_path).await {
-                let _ = fs::remove_file(&tmp_path).await;
-                return Err(S3Error::InternalError(e.to_string()));
+        Ok((etag, encryption))
+    }
+
+    /// Atomically write raw sidecar bytes, keeping the quota balanced.
+    async fn write_sidecar_bytes(
+        &self,
+        meta_path: &std::path::Path,
+        data: &[u8],
+    ) -> Result<(), S3Error> {
+        let tmp_path = self.tmp_file();
+        fs::write(&tmp_path, data)
+            .await
+            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        let replaced = file_size(meta_path).await;
+        crate::storage::rename_into(&tmp_path, meta_path)
+            .await
+            .map_err(super::path_conflict_error)?;
+        self.quota.add(data.len() as u64);
+        self.quota.release(replaced);
+        Ok(())
+    }
+
+    /// Remove the empty directories between `path` and the bucket root.
+    async fn remove_empty_parents(&self, bucket: &str, path: &std::path::Path) {
+        let bucket_root = self.data_dir.join(bucket);
+        let mut current = path.parent().map(|p| p.to_path_buf());
+        while let Some(dir) = current {
+            if dir == bucket_root || fs::remove_dir(&dir).await.is_err() {
+                break;
             }
-            reservation.commit(written);
-            self.quota.release(replaced);
+            current = dir.parent().map(|p| p.to_path_buf());
+        }
+    }
+
+    /// Publish a fully written temporary file as object `key`, with its
+    /// sidecar, under the per-path lock. The sidecar goes first: if it cannot
+    /// be written nothing is published (an encrypted object can never be
+    /// served without its parameters). If the data rename then fails, the
+    /// previous sidecar is restored. Returns (published bytes, replaced bytes);
+    /// the caller settles the data bytes with the quota.
+    pub(crate) async fn publish_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        object_path: &std::path::Path,
+        tmp_path: &std::path::Path,
+        metadata: &StoredMetadata,
+    ) -> Result<(u64, u64), S3Error> {
+        let path_guard = self.quota.lock_path(object_path).await;
+        let meta_path = self.object_meta_path(bucket, key)?;
+        let previous_sidecar = fs::read(&meta_path).await.ok();
+        if let Err(e) = self.put_object_metadata(bucket, key, metadata).await {
+            // Drop the parent directories created for this object, if empty
+            self.remove_empty_parents(bucket, object_path).await;
+            return Err(e);
         }
 
-        Ok(etag)
+        let stored = file_size(tmp_path).await;
+        let replaced = file_size(object_path).await;
+        if let Err(e) = crate::storage::rename_into(tmp_path, object_path).await {
+            // Put back the exact previous sidecar bytes (never a re-parsed copy
+            // that could drop encryption parameters or unknown fields)
+            let restored = match previous_sidecar {
+                Some(old) => self.write_sidecar_bytes(&meta_path, &old).await,
+                None => self.delete_object_metadata(bucket, key).await,
+            };
+            if let Err(re) = restored {
+                eprintln!("Failed to restore the sidecar of {bucket}/{key}: {re:?}");
+            }
+            return Err(super::path_conflict_error(e));
+        }
+        // Release the data lock first: delete_object_acl takes the ACL path
+        // lock (stripes must never nest)
+        drop(path_guard);
+        // A new object starts private, as on S3: an ACL granted on the object
+        // it replaces (e.g. public-read) must not carry over
+        let _ = self.delete_object_acl(bucket, key).await;
+        Ok((stored, replaced))
     }
 
     /// Get object metadata and file path for streaming by the handler.
@@ -234,71 +334,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Copy an object within the storage (streams file-to-file, no full buffering).
-    pub async fn copy_object(
-        &self,
-        src_bucket: &str,
-        src_key: &str,
-        dst_bucket: &str,
-        dst_key: &str,
-    ) -> Result<ObjectMetadata, S3Error> {
-        self.head_bucket(src_bucket).await?;
-        self.head_bucket(dst_bucket).await?;
-
-        let src_path = self.object_path(src_bucket, src_key)?;
-        if !is_regular_file(&src_path).await {
-            return Err(S3Error::NoSuchKey);
-        }
-
-        let dst_path = self.object_path(dst_bucket, dst_key)?;
-        if let Some(parent) = dst_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        }
-
-        // UUID-based temp file for atomic copy
-        let tmp_path = self.tmp_file();
-        fs::copy(&src_path, &tmp_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        crate::storage::rename_into(&tmp_path, &dst_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
-
-        let etag = compute_file_md5(&dst_path).await?;
-
-        let meta = fs::symlink_metadata(&dst_path)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
-
-        let last_modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-
-        // Copy metadata sidecar from source to destination
-        let stored = self.get_stored_metadata(src_bucket, src_key).await?;
-        self.put_object_metadata(dst_bucket, dst_key, &stored)
-            .await?;
-
-        let content_type = stored
-            .content_type
-            .clone()
-            .unwrap_or_else(|| guess_content_type(dst_key));
-
-        Ok(ObjectMetadata {
-            content_length: meta.len(),
-            last_modified,
-            etag,
-            content_type,
-            cache_control: stored.cache_control,
-            content_disposition: stored.content_disposition,
-            content_encoding: stored.content_encoding,
-            content_language: stored.content_language,
-            expires: stored.expires,
-            user_metadata: stored.user_metadata,
-            encryption: stored.encryption,
-        })
-    }
-
     // -- Object metadata persistence --
 
     /// Path to an object's metadata sidecar: {bucket}/.meta/{key}.json
@@ -318,7 +353,7 @@ impl Storage {
         if let Some(parent) = meta_path.parent() {
             fs::create_dir_all(parent)
                 .await
-                .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                .map_err(super::path_conflict_error)?;
         }
         let json =
             serde_json::to_vec(metadata).map_err(|e| S3Error::InternalError(e.to_string()))?;
@@ -326,14 +361,42 @@ impl Storage {
         fs::write(&tmp_path, &json)
             .await
             .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        if let Err(e) = crate::storage::rename_into(&tmp_path, &meta_path).await {
-            let _ = fs::remove_file(&tmp_path).await;
-            return Err(S3Error::InternalError(e.to_string()));
-        }
+        let replaced = file_size(&meta_path).await;
+        crate::storage::rename_into(&tmp_path, &meta_path)
+            .await
+            .map_err(super::path_conflict_error)?;
+        // Sidecars count toward the quota like the data they describe
+        self.quota.add(json.len() as u64);
+        self.quota.release(replaced);
         Ok(())
     }
 
     /// Read object metadata from disk. Returns Default if no metadata file exists.
+    /// ETag and size reported by listings: taken from the sidecar when known
+    /// (no full read of the object; plaintext size and ETag for encrypted
+    /// objects), computed only for objects written before ETags were stored.
+    pub(crate) async fn listed_etag_and_size(
+        &self,
+        bucket: &str,
+        key: &str,
+        path: &std::path::Path,
+        file_len: u64,
+    ) -> (String, u64) {
+        let stored = self
+            .get_stored_metadata(bucket, key)
+            .await
+            .unwrap_or_default();
+        let size = stored
+            .encryption
+            .as_ref()
+            .map_or(file_len, |e| e.plaintext_size);
+        let etag = match stored.etag {
+            Some(etag) => etag,
+            None => compute_file_md5(path).await.unwrap_or_default(),
+        };
+        (etag, size)
+    }
+
     pub async fn get_stored_metadata(
         &self,
         bucket: &str,
@@ -353,7 +416,10 @@ impl Storage {
     pub async fn delete_object_metadata(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
         let meta_path = self.object_meta_path(bucket, key)?;
         if is_regular_file(&meta_path).await {
-            let _ = fs::remove_file(&meta_path).await;
+            let size = file_size(&meta_path).await;
+            if fs::remove_file(&meta_path).await.is_ok() {
+                self.quota.release(size);
+            }
             // Clean up empty parent directories up to .meta/
             let meta_root = self.data_dir.join(bucket).join(META_DIR);
             let mut current = meta_path.parent().map(|p| p.to_path_buf());
@@ -410,7 +476,7 @@ impl Storage {
                 // Check if key has delimiter after prefix
                 let after_prefix = &key[prefix.len()..];
                 if let Some(pos) = after_prefix.find(delimiter) {
-                    let cp = format!("{}{}", prefix, &after_prefix[..=pos]);
+                    let cp = format!("{}{}", prefix, &after_prefix[..pos + delimiter.len()]);
                     common_prefixes.insert(cp);
                     continue;
                 }
@@ -436,11 +502,13 @@ impl Storage {
             };
             if let Ok(meta) = fs::symlink_metadata(&object_path).await {
                 if meta.is_file() && !meta.file_type().is_symlink() {
-                    let etag = compute_file_md5(&object_path).await.unwrap_or_default();
+                    let (etag, size) = self
+                        .listed_etag_and_size(bucket, key, &object_path, meta.len())
+                        .await;
                     result_objects.push(ObjectInfo {
                         key: key.clone(),
                         last_modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                        size: meta.len(),
+                        size,
                         etag,
                     });
                     count += 1;
@@ -502,8 +570,10 @@ async fn collect_keys(
             continue;
         }
 
-        // Skip internal files and directories
-        if INTERNAL_NAMES.contains(&name.as_str()) {
+        // Skip internal files and directories. They only exist at the bucket
+        // root: deeper, the same names are ordinary user keys (`d/.meta`) and
+        // must stay visible in listings.
+        if current == base && INTERNAL_NAMES.contains(&name.as_str()) {
             continue;
         }
 
@@ -542,12 +612,16 @@ pub(crate) async fn stream_body_to_file(
     file: &mut tokio::fs::File,
     mut body: Incoming,
     aws_chunked: bool,
+    check: PayloadCheck,
     reservation: &mut Reservation,
 ) -> Result<(String, u64), S3Error> {
     let mut md5_ctx = md5::Context::new();
-    let mut decoder = aws_chunked.then(AwsChunkedDecoder::new);
+    let mut reader = BodyReader::new(aws_chunked, check);
     let mut decoded = Vec::new();
     let mut total: u64 = 0;
+    let min_rate = min_upload_rate();
+    let mut window_start = std::time::Instant::now();
+    let mut window_bytes: u64 = 0;
 
     loop {
         // A client that stops sending must not hold its quota reservation forever
@@ -560,14 +634,23 @@ pub(crate) async fn stream_body_to_file(
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        let payload: &[u8] = match decoder.as_mut() {
-            Some(dec) => {
-                decoded.clear();
-                dec.feed(&data, &mut decoded)?;
-                &decoded
+        decoded.clear();
+        reader.feed(&data, &mut decoded)?;
+        let payload: &[u8] = &decoded;
+        // A client trickling bytes would otherwise keep its whole up-front
+        // reservation (declared size) forever, blocking every other write.
+        // Checked on every frame (including frames that only carry
+        // aws-chunked framing) per window of at least 60 s, against the time
+        // actually elapsed, so an early burst gives no credit.
+        window_bytes += data.len() as u64;
+        let window = window_start.elapsed();
+        if min_rate > 0 && window >= BODY_RATE_WINDOW {
+            if window_bytes < min_rate.saturating_mul(window.as_secs()) {
+                return Err(S3Error::RequestTimeout);
             }
-            None => &data,
-        };
+            window_start = std::time::Instant::now();
+            window_bytes = 0;
+        }
         if payload.is_empty() {
             continue;
         }
@@ -579,19 +662,93 @@ pub(crate) async fn stream_body_to_file(
         total += payload.len() as u64;
     }
 
-    if let Some(dec) = decoder {
-        if !dec.is_complete() {
-            return Err(S3Error::InvalidArgument(
-                "Incomplete aws-chunked body (missing final chunk).".to_string(),
-            ));
-        }
-    }
+    reader.finish()?;
 
     file.flush()
         .await
         .map_err(|e| S3Error::InternalError(e.to_string()))?;
 
     Ok((format!("\"{:x}\"", md5_ctx.finalize()), total))
+}
+
+/// Decodes a request body (aws-chunked or raw) and enforces the integrity
+/// check required by its signature (`PayloadCheck`). Callers must discard
+/// everything they wrote if `feed` or `finish` fails.
+pub(crate) struct BodyReader {
+    decoder: Option<AwsChunkedDecoder>,
+    sha256: Option<(Sha256, String)>,
+}
+
+impl BodyReader {
+    pub(crate) fn new(aws_chunked: bool, check: PayloadCheck) -> Self {
+        match check {
+            PayloadCheck::None => Self {
+                decoder: aws_chunked.then(AwsChunkedDecoder::new),
+                sha256: None,
+            },
+            // The hash covers the body as sent (before aws-chunked decoding)
+            PayloadCheck::Sha256(expected) => Self {
+                decoder: aws_chunked.then(AwsChunkedDecoder::new),
+                sha256: Some((Sha256::new(), expected)),
+            },
+            // Signed chunks are aws-chunked by definition
+            PayloadCheck::ChunkSignatures(signer) => Self {
+                decoder: Some(AwsChunkedDecoder::with_signer(Some(signer))),
+                sha256: None,
+            },
+        }
+    }
+
+    /// Feed raw body bytes; decoded payload bytes are appended to `out`.
+    pub(crate) fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), S3Error> {
+        if let Some((hasher, _)) = self.sha256.as_mut() {
+            hasher.update(data);
+        }
+        match self.decoder.as_mut() {
+            Some(dec) => dec.feed(data, out),
+            None => {
+                out.extend_from_slice(data);
+                Ok(())
+            }
+        }
+    }
+
+    /// Check completeness and the payload hash once the body has ended.
+    pub(crate) fn finish(self) -> Result<(), S3Error> {
+        if let Some(dec) = self.decoder
+            && !dec.is_complete()
+        {
+            return Err(S3Error::InvalidArgument(
+                "Incomplete aws-chunked body (missing final chunk).".to_string(),
+            ));
+        }
+        if let Some((hasher, expected)) = self.sha256
+            && hex_lower(&hasher.finalize()) != expected
+        {
+            return Err(S3Error::XAmzContentSHA256Mismatch);
+        }
+        Ok(())
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Uploads that send less than `min_upload_rate()` bytes per second over a
+/// `BODY_RATE_WINDOW` are aborted.
+const BODY_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_MIN_UPLOAD_RATE: u64 = 4 * 1024;
+
+/// Minimum upload rate in bytes/s (`S3_MIN_UPLOAD_RATE`, 0 disables the check).
+fn min_upload_rate() -> u64 {
+    static RATE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        std::env::var("S3_MIN_UPLOAD_RATE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_MIN_UPLOAD_RATE)
+    })
 }
 
 /// Maximum time without receiving any body data before an upload is aborted.
@@ -616,14 +773,36 @@ enum ChunkState {
 struct AwsChunkedDecoder {
     state: ChunkState,
     header: Vec<u8>,
+    /// Set for STREAMING-AWS4-HMAC-SHA256-PAYLOAD: every chunk signature is verified.
+    signer: Option<crate::auth::ChunkSigner>,
+    chunk_signature: String,
+    chunk_hash: Sha256,
 }
 
 impl AwsChunkedDecoder {
     fn new() -> Self {
+        Self::with_signer(None)
+    }
+
+    fn with_signer(signer: Option<crate::auth::ChunkSigner>) -> Self {
         Self {
             state: ChunkState::Header,
             header: Vec::new(),
+            signer,
+            chunk_signature: String::new(),
+            chunk_hash: Sha256::new(),
         }
+    }
+
+    /// Verify the signature of the chunk that just ended (no-op without signer).
+    fn verify_chunk(&mut self) -> Result<(), S3Error> {
+        let digest = std::mem::replace(&mut self.chunk_hash, Sha256::new()).finalize();
+        if let Some(signer) = self.signer.as_mut()
+            && !signer.verify_next(&hex_lower(&digest), &self.chunk_signature)
+        {
+            return Err(S3Error::SignatureDoesNotMatch);
+        }
+        Ok(())
     }
 
     /// True once the final zero-size chunk has been read.
@@ -651,10 +830,19 @@ impl AwsChunkedDecoder {
                     }
                     let line = std::str::from_utf8(&self.header).map_err(|_| malformed())?;
                     let line = line.strip_suffix('\r').unwrap_or(line);
-                    let size_str = line.split(';').next().unwrap_or("").trim();
+                    let mut parts = line.split(';');
+                    let size_str = parts.next().unwrap_or("").trim();
                     let size = u64::from_str_radix(size_str, 16).map_err(|_| malformed())?;
+                    if self.signer.is_some() {
+                        self.chunk_signature = parts
+                            .find_map(|p| p.trim().strip_prefix("chunk-signature="))
+                            .ok_or(S3Error::SignatureDoesNotMatch)?
+                            .to_string();
+                    }
                     self.header.clear();
                     self.state = if size == 0 {
+                        // The final empty chunk is signed too
+                        self.verify_chunk()?;
                         ChunkState::Done
                     } else {
                         ChunkState::Data(size)
@@ -662,9 +850,13 @@ impl AwsChunkedDecoder {
                 }
                 ChunkState::Data(remaining) => {
                     let n = remaining.min(input.len() as u64) as usize;
+                    if self.signer.is_some() {
+                        self.chunk_hash.update(&input[..n]);
+                    }
                     out.extend_from_slice(&input[..n]);
                     input = &input[n..];
                     self.state = if remaining == n as u64 {
+                        self.verify_chunk()?;
                         ChunkState::DataEnd(2)
                     } else {
                         ChunkState::Data(remaining - n as u64)

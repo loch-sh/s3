@@ -4,7 +4,7 @@
 #   docker buildx imagetools inspect mirror.gcr.io/library/<image>:<tag>
 
 # Stage 1: Build
-FROM mirror.gcr.io/library/rust:1.99.1-alpine3.24@sha256:f432d4b8663fbc50b29e33846bf6a1fb9f17f142023598899d641cddf57c6b22 AS builder
+FROM mirror.gcr.io/library/rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./

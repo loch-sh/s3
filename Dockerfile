@@ -12,7 +12,7 @@ COPY src/ src/
 RUN cargo build --release --locked
 
 # Stage 2: Runtime
-FROM mirror.gcr.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM mirror.gcr.io/library/alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4
 # Fixed, unprivileged uid/gid 100:101: the values Alpine assigned to the `s3`
 # system user in images up to 1.2.0, so existing /data volumes stay writable.
 # The server also runs under any other uid

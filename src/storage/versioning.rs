@@ -27,6 +27,11 @@ fn random_suffix() -> u32 {
 /// previous one: same or earlier millisecond → previous suffix + 1.
 fn next_version_parts(now_ms: i64, random: u32) -> (i64, u32) {
     let mut last = LAST_VERSION.lock().unwrap_or_else(|e| e.into_inner());
+    advance_version_parts(&mut last, now_ms, random)
+}
+
+/// Advance `last` to the next (timestamp, suffix) pair and return it.
+fn advance_version_parts(last: &mut (i64, u32), now_ms: i64, random: u32) -> (i64, u32) {
     let next = if now_ms > last.0 {
         (now_ms, random)
     } else {
@@ -889,16 +894,18 @@ mod tests {
 
     #[test]
     fn test_next_version_parts_clock_and_overflow() {
-        use super::next_version_parts;
-        // Far in the future so the global state of other tests does not interfere.
-        let t = 99_999_999_999_000;
-        assert_eq!(next_version_parts(t, 5), (t, 5));
+        use super::advance_version_parts;
+        // Local state: the global one is shared with the tests running in
+        // parallel, which generate version IDs too.
+        let mut last = (0, 0);
+        let t = 1_730_000_000_000;
+        assert_eq!(advance_version_parts(&mut last, t, 5), (t, 5));
         // Same millisecond, and clock stepping back: suffix + 1
-        assert_eq!(next_version_parts(t, 1), (t, 6));
-        assert_eq!(next_version_parts(t - 10, 1), (t, 7));
+        assert_eq!(advance_version_parts(&mut last, t, 1), (t, 6));
+        assert_eq!(advance_version_parts(&mut last, t - 10, 1), (t, 7));
         // Suffix overflow moves to the next millisecond
-        assert_eq!(next_version_parts(t + 1, u32::MAX), (t + 1, u32::MAX));
-        assert_eq!(next_version_parts(t + 1, 3), (t + 2, 3));
+        assert_eq!(advance_version_parts(&mut last, t + 1, u32::MAX), (t + 1, u32::MAX));
+        assert_eq!(advance_version_parts(&mut last, t + 1, 3), (t + 2, 3));
     }
 
     #[test]
